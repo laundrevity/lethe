@@ -1,0 +1,6 @@
+models/
+vendor/llama.cpp/build/
+.venv/
+__pycache__/
+*.egg-info/
+.lethe/
