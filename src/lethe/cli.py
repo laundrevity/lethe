@@ -16,7 +16,7 @@ from . import hub, server
 from .chat import INSTRUCT_SAMPLING, THINKING_SAMPLING, Delta, TurnStats, stream_chat
 from .ggufmeta import ModelShape, parse_local, quant_from_filename, shape_from_kv
 from .paths import find_ggufs, llama_bin, llama_dir, models_dir
-from .sysinfo import GiB, fmt_bytes, machine
+from .sysinfo import GiB, fmt_bytes, llama_processes, machine, wired_bytes
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, rich_markup_mode="rich")
 con = Console()
@@ -118,7 +118,18 @@ def _budget_line(kv: str) -> int:
         f"[dim]{m.chip} · RAM {fmt_bytes(m.total_ram)} · GPU-wired limit {fmt_bytes(m.gpu_wired_limit)} · "
         f"model+KV budget {fmt_bytes(m.usable_for_model)} · KV cache {kv}[/]"
     )
+    _in_use_line()
     return m.usable_for_model
+
+
+def _in_use_line() -> None:
+    """Tell the user what other model processes are already holding, so 'fits' is honest."""
+    ours = {r["pid"] for r in server.running_servers()}
+    others = [p for p in llama_processes() if p.pid not in ours and p.rss > 256 * 1024 * 1024]
+    mine = [p for p in llama_processes() if p.pid in ours]
+    if others or mine:
+        bits = [f"pid {p.pid} {fmt_bytes(p.rss)} ({'lethe' if p.pid in ours else Path(p.cmd.split()[0]).parent.parent.parent.name})" for p in mine + others]
+        con.print(f"[dim]in use now: {', '.join(bits)} · wired total {fmt_bytes(wired_bytes())}[/]")
 
 
 # ----------------------------------------------------------------------------- commands
@@ -298,28 +309,34 @@ def models(kv: str = typer.Option("f16", help="KV cache type for memory columns:
 
 
 def _plan_ctx(shape: ModelShape, size: int, ctx: int, kv: str, draft_size: int) -> int:
-    """Pick/validate a context size and print the memory plan."""
+    """Pick/validate a context size against what is free *now* and print the memory plan."""
     m = machine()
     kvb = KV_BYTES[kv]
     per = shape.kv_bytes_per_token(kvb)
     fixed = size + draft_size
-    max_fit = shape.max_ctx_for(m.usable_for_model, fixed, kvb)
+    capacity = m.usable_for_model
+    available = m.available_now()
+    budget = min(capacity, available)
+    max_fit = shape.max_ctx_for(budget, fixed, kvb)
     if ctx == 0:
         ctx = shape.n_ctx_train
         if ctx > max_fit:
             ctx = max(4096, (max_fit // 4096) * 4096)
-            con.print(f"[yellow]native context {shape.n_ctx_train:,} does not fit; using {ctx:,}[/]")
+            con.print(f"[yellow]native context {shape.n_ctx_train:,} does not fit in what's free; using {ctx:,}[/]")
     kv_total = per * ctx
     total = fixed + kv_total
-    color = "green" if total <= m.usable_for_model else "red"
+    color = "green" if total <= budget else "red"
     con.print(
         f"context [bold]{ctx:,}[/] (native max {shape.n_ctx_train:,}) · "
         f"model {fmt_bytes(size)}"
         + (f" + draft {fmt_bytes(draft_size)}" if draft_size else "")
-        + f" + KV {fmt_bytes(kv_total)} ({kv}, {per / 1024:.0f} KiB/tok) = [{color}]{fmt_bytes(total)}[/] of {fmt_bytes(m.usable_for_model)} budget"
+        + f" + KV {fmt_bytes(kv_total)} ({kv}, {per / 1024:.0f} KiB/tok) = [{color}]{fmt_bytes(total)}[/]"
+        + f" of {fmt_bytes(available)} free now ({fmt_bytes(capacity)} capacity)"
     )
-    if total > m.usable_for_model:
-        con.print(f"[red]that exceeds the GPU-wired budget[/] — lower --ctx (max ≈ {max_fit:,}) or use --kv q8_0")
+    if available < capacity - 2 * GiB:
+        _in_use_line()
+    if total > budget:
+        con.print(f"[red]that exceeds what is free[/] — stop other models, lower --ctx (max ≈ {max_fit:,}), or use --kv q8_0")
     return ctx
 
 
@@ -346,6 +363,9 @@ def serve(
     size = sum(f.stat().st_size for f in path.parent.glob(path.name.replace(".gguf", "*.gguf")) if f.is_file())
     draft_path = _find_draft(path) if (mtp and draft) else None
     draft_size = draft_path.stat().st_size if draft_path else 0
+    if server.running_servers():  # free our own memory before planning against what's available
+        con.print("stopping previous server…")
+        server.stop()
     ctx = _plan_ctx(shape, size, ctx, kv, draft_size)
     if mtp and not shape.has_mtp and not draft_path:
         con.print("[yellow]model has no MTP head; disabling speculative decoding[/]")
@@ -360,9 +380,6 @@ def serve(
         + (f" (depth {draft_n})" if mtp else "")
         + f" · thinking {'on' + (' ' + effort if effort else '') if thinking else 'off'}"
     )
-    if server.running_servers():
-        con.print("stopping previous server…")
-        server.stop()
     if foreground:
         con.print("[dim]$ " + " ".join(cfg.argv()) + "[/]")
         raise typer.Exit(subprocess.call(cfg.argv()))

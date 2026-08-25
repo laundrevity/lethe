@@ -34,6 +34,42 @@ def _metal_device_bytes() -> int | None:
 
 
 @dataclass
+class OtherProcess:
+    pid: int
+    rss: int
+    cmd: str
+
+
+def wired_bytes() -> int:
+    """Memory currently wired down system-wide (GPU-resident model weights + KV show up here)."""
+    try:
+        out = subprocess.run(["vm_stat"], capture_output=True, text=True, check=True).stdout
+        page = int(re.search(r"page size of (\d+)", out).group(1))
+        wired = int(re.search(r"Pages wired down:\s+(\d+)", out).group(1))
+        return wired * page
+    except Exception:
+        return 0
+
+
+def llama_processes() -> list[OtherProcess]:
+    """Every llama-server / llama-cli on the machine, ours or not, with resident memory."""
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,rss=,args="], capture_output=True, text=True, check=True).stdout
+    except Exception:
+        return []
+    procs = []
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, rss_kb, cmd = parts
+        exe = cmd.split()[0]
+        if exe.endswith(("llama-server", "llama-cli", "llama-bench")):
+            procs.append(OtherProcess(int(pid), int(rss_kb) * 1024, cmd))
+    return procs
+
+
+@dataclass
 class Machine:
     total_ram: int  # bytes
     gpu_wired_limit: int  # bytes the GPU may wire; the real ceiling for -ngl all
@@ -43,8 +79,14 @@ class Machine:
 
     @property
     def usable_for_model(self) -> int:
-        """Budget we hand to a model: GPU-wired ceiling minus ~4 GiB headroom for OS + compute buffers."""
+        """Capacity we hand to a model: GPU-wired ceiling minus ~4 GiB headroom for OS + compute buffers."""
         return max(0, self.gpu_wired_limit - 4 * GiB)
+
+    def available_now(self, excluding_rss: int = 0) -> int:
+        """What is free *right now*: capacity minus what's already wired by everything else.
+        `excluding_rss` = memory of our own server that is about to be stopped."""
+        committed = max(0, wired_bytes() - excluding_rss)
+        return max(0, self.usable_for_model - committed)
 
 
 def machine() -> Machine:

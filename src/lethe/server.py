@@ -117,15 +117,15 @@ def running_servers() -> list[dict]:
     """Find our llama-server processes from the process table (no state file)."""
     exe = str(llama_bin("llama-server"))
     try:
-        out = subprocess.run(["ps", "-axo", "pid=,args="], capture_output=True, text=True, check=True).stdout
+        out = subprocess.run(["ps", "-axo", "pid=,rss=,args="], capture_output=True, text=True, check=True).stdout
     except Exception:
         return []
     found = []
     for line in out.splitlines():
-        line = line.strip()
-        if not line:
+        parts = line.split(None, 2)
+        if len(parts) < 3:
             continue
-        pid_s, _, args = line.partition(" ")
+        pid_s, rss_kb, args = parts
         if not args.startswith(exe):
             continue
         argv = shlex.split(args)
@@ -133,9 +133,11 @@ def running_servers() -> list[dict]:
         host = _argv_value(argv, "--host") or "127.0.0.1"
         found.append({
             "pid": int(pid_s),
+            "rss": int(rss_kb) * 1024,
             "url": base_url(port, host),
             "port": port,
             "model": _argv_value(argv, "--model") or "?",
+            "api_key": _argv_value(argv, "--api-key"),
             "argv": argv,
             "logging": "--log-disable" not in argv,
         })
