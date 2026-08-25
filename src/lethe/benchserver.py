@@ -58,7 +58,14 @@ def run_server_bench(lm: S.LocalModel, *, depths: list[int], kv: str, launch) ->
                      no_mmap=False, log=False, api_key=True, extra=[], **opts)
         url, key = rec["url"], rec.get("api_key")
         for d in depths:
-            prefix = _filler_of_tokens(url, key, d)
+            # prompt processing: one uncached prefill of max(2048, depth) tokens, 1 token out.
+            # It also primes the prefix cache, so the generation prompts below only pay for their own text.
+            pp_prefix = _filler_of_tokens(url, key, max(2048, d))
+            with con.status(f"{name} · depth {d:,} · prefill…"):
+                pp_stats = [ev for ev in stream_chat(url, [{"role": "user", "content": pp_prefix + "\n\nReply with OK."}], n_ctx=ctx, sampling={"temperature": 0.0}, max_tokens=1, chat_template_kwargs={"enable_thinking": False}, api_key=key) if isinstance(ev, TurnStats)]
+            pp = pp_stats[-1].prompt_tps
+            con.print(f"[dim]  {name} · d{d:,} · prefill: {pp_stats[-1].prompt_n:,} tok @ {pp:,.0f} tok/s[/]")
+            prefix = pp_prefix if d > 0 else ""
             stats: list[TurnStats] = []
             for pname, ptext in PROMPTS.items():
                 msgs = [{"role": "user", "content": (prefix + "\n\n---\n\nIgnore the text above. " if prefix else "") + ptext}]
@@ -68,8 +75,6 @@ def run_server_bench(lm: S.LocalModel, *, depths: list[int], kv: str, launch) ->
                         if isinstance(ev, TurnStats):
                             stats.append(ev)
                 con.print(f"[dim]  {name} · d{d:,} · {pname}: {stats[-1].line(markup=False)} · {time.time() - t0:.1f}s[/]")
-            # pp from the first prompt (the others hit the prefix cache); tg averaged over all
-            pp = stats[0].prompt_tps
             gen_n = sum(s.predicted_n for s in stats)
             gen_ms = sum(s.predicted_ms for s in stats)
             dn = sum(s.draft_n for s in stats)

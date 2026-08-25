@@ -34,7 +34,7 @@ model's inputs and outputs. Every feature must preserve that:
   reasoning flags, or hybrid-attention models. The Python side talks to `llama-server` over HTTP
   (`/v1/chat/completions` streaming; the final chunk's `timings` gives prompt/gen tok/s and
   `draft_n`/`draft_n_accepted`; `/props` gives `n_ctx`).
-- **Submodule pin = upstream master `f280b26` (2026-08-24) + one local commit** on branch
+- **Submodule pin = upstream master `1729ed5` (2026-08-25) + one local commit** on branch
   `lethe-fastmtp` applying `models/**/HauhauCS-FastMTP-llama.cpp.patch` (a `d2t` draft-vocab trim in
   `src/models/qwen35.cpp`). The build script applies/commits the patch automatically. Bumping upstream
   means re-running `git apply --check` on that patch; `qwen35.cpp` is the only file it touches.

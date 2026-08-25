@@ -108,13 +108,22 @@ other processes (e.g. another llama-server). Real usage adds 1–3 GiB of comput
 
 ## Reference numbers — M5 Max, 128 GB, Qwen3.8-27B Q8_K_P
 
+`lethe bench` (llama-bench, no speculative decoding):
+
 | | pp2048 | tg128 |
 |---|---:|---:|
-| `llama-bench` (no MTP), depth 0 | 690 tok/s | 16.3 tok/s |
-| `llama-bench` (no MTP), depth 32K | 348 tok/s | 15.6 tok/s |
-| `llama-server` + FastMTP depth 3, chat | 650–700 tok/s on real prompts | 26–51 tok/s (acceptance 33–93%) |
+| depth 0 | 690 tok/s | 16.3 tok/s |
+| depth 32K | 348 tok/s | 15.6 tok/s |
 
-`lethe bench --server` reproduces the last row for any model, with and without the draft.
+`lethe bench --server -d 0` (llama-server, greedy, 256-token replies over prose/reasoning/code prompts):
+
+| config | pp tok/s | tg tok/s | accept | vs no-MTP |
+|---|---:|---:|---:|---:|
+| no MTP | 746 | 16.8 | — | 1.00× |
+| embedded MTP, depth 3 | 733 | 31.8 | 68% | 1.90× |
+| FastMTP sidecar, depth 3 | 733 | 36.2 | 62% | 2.16× |
+
+Acceptance (and therefore speed) depends on the text: 48% on free prose, 74% on code in the same run.
 
 ## Layout
 
