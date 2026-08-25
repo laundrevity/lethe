@@ -12,7 +12,14 @@ model's inputs and outputs. Every feature must preserve that:
   `--slot-save-path`, no pid/state files, no REPL history. `serve --log` is the only opt-in, and
   `lethe traces --delete` cleans it up. Never add a "save chat" default; if you add persistence, it
   must be explicit opt-in per invocation and be listed by `lethe traces`.
-- llama-server always runs with `--no-webui --no-slots`, bound to 127.0.0.1, no `--metrics`.
+- llama-server always runs with `--no-webui --no-slots`, bound to 127.0.0.1, no `--metrics`, and a
+  per-launch random `--api-key` (recovered from the process table by `chat`/`key`; it stops other local
+  software and browser pages from using the model — a same-user process could read it from `ps`, that's
+  accepted).
+- Saved conversations (`vault.py`) are the ONE content-persistence feature: opt-in per invocation
+  (`chat --save`, `/save`, `--resume`), AES-256-GCM with a scrypt-derived key, passphrase held in memory
+  only, random filenames, all metadata inside the ciphertext, plaintext never written (not even a temp
+  file), delete = overwrite then unlink. `lethe.toml` holds configuration only (default model).
 - Running servers are discovered from the process table (`server.running_servers()`), filtered to our
   own binary path — the user runs other llama-servers on this machine (e.g. port 8090); never touch them.
 - Hugging Face: `HF_HUB_DISABLE_TELEMETRY=1` (set in `hub.py` before import); downloads are anonymous
@@ -39,6 +46,13 @@ model's inputs and outputs. Every feature must preserve that:
 - **Models live in `./models/<owner>--<repo>/`**, downloaded via `huggingface_hub` (`hf` CLI is part of
   that package), not the shared `~/.cache/huggingface` — files are 10–60 GB and we want them explicit.
   `models/` is gitignored. `HF_TOKEN` is set in the user's shell.
+- **Models are identified as `owner/repo:QUANT`** (`spec.py`); local files are grouped by shard and
+  mapped back to that form from `models/<owner>--<repo>/`. Sampler/thinking defaults come from
+  `profiles.py`, keyed on GGUF architecture — add a profile there when adding a model family, don't
+  hard-code sampler values in the REPL. `lethe.toml` (gitignored) holds the default model.
+- **`scripts/bump-llama.sh`** moves the submodule to upstream master: it re-applies the FastMTP patch on a
+  fresh `lethe-fastmtp` branch, stages the *upstream* commit as the superproject pin (not the patch
+  commit), rebuilds and runs `doctor`. Update the pin note below when you use it.
 - **Throughput and context are first-class.** Every chat turn prints prompt tok/s, gen tok/s, MTP
   acceptance, and context used/configured. `browse`/`models` show KV bytes/token and the max context
   that fits. KV math lives in `ggufmeta.py` (own ~100-line GGUF header parser; reads only the first

@@ -4,3 +4,4 @@ vendor/llama.cpp/build/
 __pycache__/
 *.egg-info/
 .lethe/
+lethe.toml

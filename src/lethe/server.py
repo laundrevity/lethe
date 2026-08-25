@@ -45,6 +45,7 @@ class ServeConfig:
     port: int = DEFAULT_PORT
     no_mmap: bool = False
     log: bool = False  # opt-in: keep llama-server's log in .lethe/server.log
+    api_key: str | None = None  # per-launch random key: blocks other local software / web pages from using the model
     extra: list[str] = field(default_factory=list)
 
     def argv(self) -> list[str]:
@@ -68,6 +69,8 @@ class ServeConfig:
         ]
         if not self.log:
             a.append("--log-disable")
+        if self.api_key:
+            a += ["--api-key", self.api_key]
         if self.no_mmap:
             a.append("--no-mmap")
         if self.mtp:
@@ -102,8 +105,18 @@ def is_healthy(url: str, timeout: float = 1.0) -> bool:
         return False
 
 
-def props(url: str) -> dict:
-    return httpx.get(f"{url}/props", timeout=10).json()
+def auth_headers(api_key: str | None) -> dict[str, str]:
+    return {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+
+def props(url: str, api_key: str | None = None) -> dict:
+    return httpx.get(f"{url}/props", headers=auth_headers(api_key), timeout=10).json()
+
+
+def new_api_key() -> str:
+    import secrets
+
+    return secrets.token_urlsafe(24)
 
 
 def _argv_value(argv: list[str], flag: str) -> str | None:
@@ -165,7 +178,7 @@ def start(cfg: ServeConfig, wait: bool = True, on_wait=None) -> dict:
         sink = subprocess.DEVNULL
     proc = subprocess.Popen(argv, stdout=sink, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
     url = base_url(cfg.port, cfg.host)
-    rec = {"pid": proc.pid, "url": url, "port": cfg.port, "model": str(cfg.model), "argv": argv, "logging": cfg.log}
+    rec = {"pid": proc.pid, "url": url, "port": cfg.port, "model": str(cfg.model), "argv": argv, "logging": cfg.log, "api_key": cfg.api_key}
     if not wait:
         return rec
     t0 = time.time()

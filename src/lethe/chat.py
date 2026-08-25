@@ -8,6 +8,8 @@ from typing import Iterator
 
 import httpx
 
+from .server import auth_headers
+
 
 @dataclass
 class TurnStats:
@@ -34,6 +36,10 @@ class TurnStats:
         return self.cache_n + self.prompt_n + self.predicted_n
 
     @property
+    def ctx_frac(self) -> float:
+        return self.ctx_used / self.n_ctx if self.n_ctx else 0.0
+
+    @property
     def accept_rate(self) -> float | None:
         return self.draft_n_accepted / self.draft_n if self.draft_n else None
 
@@ -51,7 +57,7 @@ class TurnStats:
             finish_reason=finish,
         )
 
-    def line(self) -> str:
+    def line(self, markup: bool = True) -> str:
         parts = [
             f"prompt {self.prompt_n} tok @ {self.prompt_tps:,.0f} tok/s",
             f"gen {self.predicted_n} tok @ {self.gen_tps:.1f} tok/s",
@@ -59,7 +65,10 @@ class TurnStats:
         if self.draft_n:
             parts.append(f"mtp accept {self.accept_rate:.0%} ({self.draft_n_accepted}/{self.draft_n})")
         if self.n_ctx:
-            parts.append(f"ctx {self.ctx_used:,}/{self.n_ctx:,} ({self.ctx_used / self.n_ctx:.1%})")
+            f = self.ctx_frac
+            color = "green" if f < 0.6 else "yellow" if f < 0.85 else "red"
+            ctx = f"ctx {self.ctx_used:,}/{self.n_ctx:,} ({f:.1%})"
+            parts.append(f"[{color}]{ctx}[/]" if markup else ctx)
         if self.cache_n:
             parts.append(f"cache hit {self.cache_n}")
         if self.finish_reason and self.finish_reason != "stop":
@@ -81,6 +90,7 @@ def stream_chat(
     sampling: dict | None = None,
     max_tokens: int | None = None,
     chat_template_kwargs: dict | None = None,
+    api_key: str | None = None,
 ) -> Iterator[Delta | TurnStats]:
     """Yield Delta chunks, then a final TurnStats."""
     body: dict = {"messages": messages, "stream": True, "timings_per_token": False}
@@ -93,7 +103,7 @@ def stream_chat(
 
     finish = None
     timings: dict = {}
-    with httpx.Client(timeout=httpx.Timeout(600, connect=10)) as client:
+    with httpx.Client(timeout=httpx.Timeout(3600, connect=10), headers=auth_headers(api_key)) as client:
         with client.stream("POST", f"{url}/v1/chat/completions", json=body) as r:
             if r.status_code != 200:
                 r.read()
@@ -116,5 +126,31 @@ def stream_chat(
     yield TurnStats.from_timings(timings, n_ctx, finish)
 
 
-THINKING_SAMPLING = {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 0.0, "repeat_penalty": 1.0}
-INSTRUCT_SAMPLING = {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5, "repeat_penalty": 1.0}
+def complete(
+    url: str,
+    messages: list[dict],
+    *,
+    sampling: dict | None = None,
+    max_tokens: int | None = None,
+    chat_template_kwargs: dict | None = None,
+    api_key: str | None = None,
+) -> tuple[str, dict]:
+    """Non-streaming completion. Returns (content, timings)."""
+    body: dict = {"messages": messages, "stream": False}
+    if sampling:
+        body.update(sampling)
+    if max_tokens:
+        body["max_tokens"] = max_tokens
+    if chat_template_kwargs:
+        body["chat_template_kwargs"] = chat_template_kwargs
+    r = httpx.post(f"{url}/v1/chat/completions", json=body, headers=auth_headers(api_key), timeout=3600)
+    if r.status_code != 200:
+        raise RuntimeError(f"server {r.status_code}: {r.text[:500]}")
+    obj = r.json()
+    return obj["choices"][0]["message"].get("content") or "", obj.get("timings", {})
+
+
+def tokenize(url: str, text: str, api_key: str | None = None) -> int:
+    r = httpx.post(f"{url}/tokenize", json={"content": text}, headers=auth_headers(api_key), timeout=600)
+    r.raise_for_status()
+    return len(r.json().get("tokens", []))
