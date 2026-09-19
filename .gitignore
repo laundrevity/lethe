@@ -5,3 +5,8 @@ __pycache__/
 *.egg-info/
 .lethe/
 lethe.toml
+
+# local scratch notes (session/conversation ids, launch one-liners)
+*.last
+/rehab
+/run
