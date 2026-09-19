@@ -46,7 +46,7 @@ HELP = """\
 /save          start saving this conversation, encrypted, to .lethe/conversations/ (asks for a passphrase)
 /stats         last turn's throughput/context line
 /web [off]     enable internet tools mid-chat (search + page fetch; every request is printed) — or launch with --web
-/shell [off]   show shell status or disable it (enable at launch with --shell --shell-dir PATH)
+/shell [off]   show shell status or disable it (enable at launch with --tools [--shell-dir PATH])
 Enter sends · Ctrl+Enter / Ctrl+J / \\+Enter add a line · paste multi-line freely · Ctrl-C interrupts a reply"""
 
 
@@ -353,7 +353,7 @@ def run(cfg: ReplConfig) -> None:
                 elif "run_shell" in cfg.tools:
                     con.print(cfg.tools["run_shell"].description, markup=False)
                 else:
-                    con.print("[dim]shell tool off — enable at launch with --shell --shell-dir PATH[/]")
+                    con.print("[dim]shell tool off — enable at launch with --tools [--shell-dir PATH][/]")
             else:
                 con.print("[dim]unknown command — /help[/]")
             continue

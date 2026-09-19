@@ -38,7 +38,7 @@ So the defaults are:
 | pid / state files | none | running servers are found via the process table |
 | network | `127.0.0.1` only | |
 | `chat` REPL | writes nothing; no history file (Up-arrow recall is in-memory only) | `/wipe` clears the conversation **and** the terminal scrollback |
-| shell tool | **off**; `chat --shell --shell-dir PATH` opts in | macOS sandbox: read-only workspace + system runtime, no network, confirmation for every command; command text and captured output stay in memory unless you save the conversation |
+| shell tool | **off**; `chat --tools [--shell-dir PATH]` opts in | macOS sandbox: read-only workspace + system runtime, no network, confirmation for every command; command text and captured output stay in memory unless you save the conversation |
 | saved conversations | **off**; `chat --save` / `/save` opt in **per conversation** | AES-256-GCM, key from your passphrase via scrypt, passphrase never stored; random filenames, title/model inside the ciphertext; `lethe conversations` lists ids only (`--unlock` to see titles), `--delete` overwrites then removes |
 | clipboard | only on explicit `/copy` | clipboard managers and Universal Clipboard can persist or forward that, so it's never automatic |
 | Hugging Face | telemetry disabled; downloads anonymous unless the repo is gated | what you download is still visible to HF, as with any download |
@@ -70,9 +70,10 @@ network silence when internet tools are on.
 ## Sandboxed command-line tool
 
 ```bash
-uv run lethe --shell --shell-dir ./src       # let the model inspect this directory
-uv run lethe --tools shell --shell-dir .     # inspect the whole project
-uv run lethe --shell --shell-dir . --web     # combine shell with the separate internet tools
+uv run lethe --tools                         # shell tool, reading the current directory
+uv run lethe --tools --shell-dir ./src       # let the model inspect this directory instead
+uv run lethe --web --tools                   # internet tools + shell
+uv run lethe --tools web,fetch,shell         # or name tools explicitly (--shell is the same as bare --tools)
 ```
 
 The model gets `run_shell(command, cwd=".", timeout_seconds=10)`. It can use macOS commands such as
@@ -80,6 +81,18 @@ The model gets `run_shell(command, cwd=".", timeout_seconds=10)`. It can use mac
 execution, Lethe shows the workspace and **entire command**, then asks for confirmation (default: no).
 `--yes` only affects model downloads; shell approval is always required. `/shell` shows the scope;
 `/shell off` removes the tool. `/web off` only removes internet tools.
+
+Ask for an action when you want an actual command, for example:
+
+```text
+you › Use run_shell to execute exactly `printf lethe-shell-smoke-ok`, then report the actual stdout.
+```
+
+Lethe will show the proposed tool call and ask for approval. Enabling a tool lets the model choose
+when to use it; a hypothetical question may receive an explanation without a call. With thinking
+enabled, the model may reason before requesting the tool; Ctrl-C cancels that turn. Use `/think off`
+or launch with `--no-thinking` to disable reasoning. `--no-show-thinking` only hides its display.
+Bare `--tools` (or `--tool`, or `--shell`) enables the shell; `--web --tools` gives internet + shell.
 
 This first version is **read-only**: even writes inside the selected directory are denied, including
 temporary files, installs, edits, deletes, and caches. The directory defaults to the current working
@@ -112,6 +125,11 @@ Run the ordinary tests with `uv run pytest`. To verify the actual OS restriction
 the startup probe. These tests check allowed reads/pipelines and denied writes, outside reads,
 symlink escapes, loopback/Unix sockets, host-process access, timeouts, and output flooding.
 
+To check the model → shell → model path against an already-running server on port 8080, run
+`uv run pytest -q -s tests/test_live_tools.py --run-live-tools`. This opt-in test uses the normal
+thinking sampler, approves only the fixed `printf lethe-shell-smoke-ok` command in the read-only
+sandbox, and checks the final answer. It neither starts a server nor saves the conversation.
+
 ## Setup
 
 ```bash
@@ -142,7 +160,7 @@ from the GGUF's architecture, following each model card's recommendations; overr
 | `lethe models` | the same table for what's on disk, plus what other model processes are holding right now |
 | `lethe default [spec]` | show / set the default model |
 | `lethe serve [spec] [--ctx N] [--kv q8_0] [--no-mtp] [--no-thinking] [--effort xhigh] [--vision]` | launch `llama-server` with the memory plan printed against what is *free now*; defaults to the native max context if it fits |
-| `lethe [chat] [spec] [-f FILE …] [--save] [--resume ID] [--web] [--shell --shell-dir PATH] [--system TEXT] [--no-system]` (the command word is optional) | streaming REPL; after every turn: prompt tok/s, gen tok/s, MTP acceptance, context used/total (colored; warns at 80%) |
+| `lethe [chat] [spec] [-f FILE …] [--save] [--resume ID] [--web] [--tools [--shell-dir PATH]] [--system TEXT] [--no-system]` (the command word is optional) | streaming REPL; after every turn: prompt tok/s, gen tok/s, MTP acceptance, context used/total (colored; warns at 80%) |
 | `lethe conversations [--unlock] [--delete ID]` | encrypted saved conversations |
 | `lethe bench [spec] [-d 0,32768]` | `llama-bench` prompt/gen speeds at context depth — **no speculative decoding, this is the floor** |
 | `lethe bench [spec] --server [-d 0,32768]` | through `llama-server`: no-MTP vs embedded MTP vs FastMTP, real tok/s and acceptance |

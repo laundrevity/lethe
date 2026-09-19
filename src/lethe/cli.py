@@ -483,7 +483,7 @@ def chat(
     min_p: Optional[float] = typer.Option(None, help="Override min_p"),
     no_system: bool = typer.Option(False, "--no-system", help="No system prompt at all (default: a short one grounding the model: local, private, this hardware)"),
     web: bool = typer.Option(False, "--web", help="Shorthand for --tools web,fetch: let the model search the web and read pages"),
-    tools: Optional[str] = typer.Option(None, "--tools", help="OPT-IN model tools, comma-separated: web,fetch,shell. Web queries/URLs leave this machine; shell is read-only and offline"),
+    tools: Optional[str] = typer.Option(None, "--tools", help="OPT-IN model tools. Bare --tools = the read-only, offline shell (so --web --tools = internet + shell); or name them: web,fetch,shell"),
     shell: bool = typer.Option(False, "--shell", help="Enable a read-only, offline macOS shell tool; always asks before running commands"),
     shell_dir: Optional[Path] = typer.Option(None, "--shell-dir", help="Directory the shell may read (default: current directory); requires --shell or --tools shell"),
     searx: Optional[str] = typer.Option(None, "--searx", help="Back web search with this SearXNG instance URL instead of the ddgs metasearch"),
@@ -504,7 +504,7 @@ def chat(
     if shell:
         tool_names.append("shell")
     if shell_dir is not None and "shell" not in tool_names:
-        err.print("--shell-dir requires --shell or --tools shell", style="red")
+        err.print("--shell-dir requires --tools or --shell", style="red")
         raise typer.Exit(1)
     tool_registry: dict = {}
     if tool_names:
@@ -679,13 +679,27 @@ def traces(delete: bool = typer.Option(False, "--delete", help="Delete what is f
             shutil.rmtree(p) if p.is_dir() else p.unlink()
 
 
-def main() -> None:
-    """Entry point. Bare `lethe [chat args…]` means `lethe chat …` — chat is what you run 95% of the time."""
-    argv = sys.argv[1:]
+def _normalize_argv(argv: list[str]) -> list[str]:
+    """Bare `lethe [chat args…]` means `lethe chat …` — chat is what you run 95% of the time.
+
+    Bare `--tools` (alias `--tool`) means the local shell tool, so `--web --tools` is internet + shell;
+    `--tools web,fetch,shell` still picks tools by name.
+    """
     commands = typer.main.get_command(app).commands  # type: ignore[union-attr]
     if not argv or (argv[0] not in commands and argv[0] != "--help"):
         argv = ["chat", *argv]
-    app(argv)
+    out: list[str] = []
+    for i, a in enumerate(argv):
+        out.append("--tools" if a == "--tool" else a)
+        if a in ("--tools", "--tool"):
+            nxt = argv[i + 1] if i + 1 < len(argv) else ""
+            if not nxt or not set(nxt.split(",")) <= {"web", "fetch", "shell"}:
+                out.append("shell")
+    return out
+
+
+def main() -> None:
+    app(_normalize_argv(sys.argv[1:]))
 
 
 if __name__ == "__main__":

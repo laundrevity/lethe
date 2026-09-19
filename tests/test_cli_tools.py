@@ -9,7 +9,7 @@ from lethe.shell import SandboxUnavailable
 def test_shell_directory_requires_explicit_opt_in(tmp_path):
     result = CliRunner().invoke(cli.app, ["chat", "--shell-dir", str(tmp_path)])
     assert result.exit_code == 1
-    assert "--shell-dir requires --shell or --tools shell" in result.output
+    assert "--shell-dir requires --tools or --shell" in result.output
 
 
 def test_sandbox_failure_prevents_server_launch(monkeypatch, tmp_path):
@@ -39,3 +39,13 @@ def test_shell_and_web_flags_compose(monkeypatch, tmp_path):
     assert result.exit_code == 0, result.exception
     assert captured == [(["shell", "web"], {"shell_dir": tmp_path})]
     assert configs[0].tools == registry
+
+
+def test_bare_tools_flag_means_shell_and_composes_with_web():
+    n = cli._normalize_argv
+    assert n(["--web", "--tools"]) == ["chat", "--web", "--tools", "shell"]
+    assert n(["--tool", "--web"]) == ["chat", "--tools", "shell", "--web"]
+    assert n(["--tools", "q8_k_p"]) == ["chat", "--tools", "shell", "q8_k_p"]
+    assert n(["--tools", "--shell-dir", "src"]) == ["chat", "--tools", "shell", "--shell-dir", "src"]
+    assert n(["chat", "--tools", "web,fetch"]) == ["chat", "--tools", "web,fetch"]
+    assert n(["models"]) == ["models"]
