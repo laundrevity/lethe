@@ -129,19 +129,28 @@ class ModelShape:
     params_b: float | None
     has_mtp: bool
     extra: dict[str, Any] = field(default_factory=dict)
+    # sliding-window attention (Gemma-style iSWA): window layers cap their KV at swa_window tokens
+    kv_elems_growing: int = 0  # per-token KV elements in layers whose cache grows with context
+    kv_elems_swa: int = 0  # per-token KV elements in sliding-window layers
+    swa_window: int = 0
+    n_swa_layers: int = 0
 
-    def kv_bytes_per_token(self, kv_bytes: int = 2) -> int:
-        """F16 KV = 2 bytes/elem; q8_0 ≈ 1.06."""
-        return int(self.n_attn_layers * self.n_head_kv * (self.key_len + self.val_len) * kv_bytes)
+    def kv_bytes_per_token(self, kv_bytes: float = 2) -> int:
+        """Marginal cost of one more context token (F16 = 2 bytes/elem; q8_0 ≈ 1.06). SWA layers excluded."""
+        return int(self.kv_elems_growing * kv_bytes)
 
-    def kv_bytes(self, n_ctx: int, kv_bytes: int = 2) -> int:
-        return self.kv_bytes_per_token(kv_bytes) * n_ctx
+    def kv_fixed_bytes(self, kv_bytes: float = 2) -> int:
+        """Upper bound of the sliding-window layers' cache (they stop growing at swa_window tokens)."""
+        return int(self.kv_elems_swa * self.swa_window * kv_bytes)
 
-    def max_ctx_for(self, budget_bytes: int, model_bytes: int, kv_bytes: int = 2) -> int:
+    def kv_bytes(self, n_ctx: int, kv_bytes: float = 2) -> int:
+        return self.kv_bytes_per_token(kv_bytes) * n_ctx + int(self.kv_elems_swa * min(n_ctx, self.swa_window) * kv_bytes)
+
+    def max_ctx_for(self, budget_bytes: int, model_bytes: int, kv_bytes: float = 2) -> int:
         per = self.kv_bytes_per_token(kv_bytes)
+        free = budget_bytes - model_bytes - self.kv_fixed_bytes(kv_bytes)
         if per <= 0:
-            return self.n_ctx_train
-        free = budget_bytes - model_bytes
+            return self.n_ctx_train if free >= 0 else 0
         if free <= 0:
             return 0
         return int(free // per)
@@ -180,11 +189,9 @@ def shape_from_kv(kv: dict[str, Any], filename: str = "") -> ModelShape:
     n_layer = int(a("block_count", 0))
     n_embd = int(a("embedding_length", 0))
     n_head = a("attention.head_count", 0)
-    n_head_kv = a("attention.head_count_kv", n_head)
-    # per-layer arrays: take the max non-zero (dense layers); count layers with kv>0
-    kv_layers = None
+    n_head_kv_raw = kv.get(f"{arch}.attention.head_count_kv", n_head)  # keep per-layer arrays
+    n_head_kv = n_head_kv_raw
     if isinstance(n_head_kv, list):
-        kv_layers = sum(1 for x in n_head_kv if x)
         n_head_kv = max(n_head_kv) if n_head_kv else 0
     if isinstance(n_head, list):
         n_head = max(n_head) if n_head else 0
@@ -192,14 +199,36 @@ def shape_from_kv(kv: dict[str, Any], filename: str = "") -> ModelShape:
     key_len = int(a("attention.key_length", (n_embd // n_head) if n_head else 0))
     val_len = int(a("attention.value_length", key_len))
 
+    # sliding-window attention (Gemma-style): pattern is a per-layer bool array (True = window layer)
+    # or an integer period p (every p-th layer global, like llama.cpp set_swa_pattern)
+    swa_window = int(a("attention.sliding_window", 0) or 0)
+    pattern = kv.get(f"{arch}.attention.sliding_window_pattern")
+    key_swa = int(a("attention.key_length_swa", key_len) or key_len)
+    val_swa = int(a("attention.value_length_swa", val_len) or val_len)
+    if swa_window and pattern is not None and not (isinstance(pattern, dict)):
+        if isinstance(pattern, list):
+            is_swa = [bool(x) for x in pattern] + [False] * (n_layer - len(pattern))
+        else:
+            is_swa = [((i + 1) % int(pattern)) != 0 for i in range(n_layer)]
+    elif swa_window:
+        is_swa = [True] * n_layer  # window everywhere (no pattern key): nothing grows past the window
+    else:
+        is_swa = [False] * n_layer
+
+    # per-layer KV heads (0 = recurrent/no-KV layer)
+    hkv = list(n_head_kv_raw) if isinstance(n_head_kv_raw, list) else [n_head_kv] * n_layer
+    hkv += [n_head_kv] * (n_layer - len(hkv))
+
     # hybrid recurrent/attention models: only every Nth layer has a KV cache
     interval = a("full_attention_interval")
-    if kv_layers is not None:
-        n_attn = kv_layers
-    elif interval:
-        n_attn = n_layer // int(interval)
-    else:
-        n_attn = n_layer
+    if not isinstance(n_head_kv_raw, list) and interval:
+        keep = [((i + 1) % int(interval)) == 0 for i in range(n_layer)]
+        hkv = [h if k else 0 for h, k in zip(hkv, keep)]
+
+    kv_elems_growing = sum(h * (key_len + val_len) for i, h in enumerate(hkv[:n_layer]) if h and not is_swa[i])
+    kv_elems_swa = sum(h * (key_swa + val_swa) for i, h in enumerate(hkv[:n_layer]) if h and is_swa[i])
+    n_swa_layers = sum(1 for i, h in enumerate(hkv[:n_layer]) if h and is_swa[i])
+    n_attn = sum(1 for h in hkv[:n_layer] if h) - n_swa_layers
 
     vocab = kv.get("tokenizer.ggml.tokens")
     n_vocab = vocab["__array_len__"] if isinstance(vocab, dict) else (len(vocab) if vocab else int(a("vocab_size", 0) or 0))
@@ -231,6 +260,10 @@ def shape_from_kv(kv: dict[str, Any], filename: str = "") -> ModelShape:
         quant=quant,
         params_b=params_b,
         has_mtp=has_mtp,
+        kv_elems_growing=kv_elems_growing,
+        kv_elems_swa=kv_elems_swa,
+        swa_window=swa_window,
+        n_swa_layers=n_swa_layers,
         extra={
             "n_head": n_head,
             "full_attention_interval": interval,

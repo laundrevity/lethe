@@ -80,6 +80,7 @@ class TurnStats:
 class Delta:
     content: str = ""
     reasoning: str = ""
+    tool_calls: list[dict] | None = None  # complete accumulated calls, yielded once at stream end
 
 
 def stream_chat(
@@ -91,8 +92,9 @@ def stream_chat(
     max_tokens: int | None = None,
     chat_template_kwargs: dict | None = None,
     api_key: str | None = None,
+    tools: list[dict] | None = None,
 ) -> Iterator[Delta | TurnStats]:
-    """Yield Delta chunks, then a final TurnStats."""
+    """Yield Delta chunks (a final one may carry tool_calls), then a final TurnStats."""
     body: dict = {"messages": messages, "stream": True, "timings_per_token": False}
     if sampling:
         body.update(sampling)
@@ -100,9 +102,13 @@ def stream_chat(
         body["max_tokens"] = max_tokens
     if chat_template_kwargs:
         body["chat_template_kwargs"] = chat_template_kwargs
+    if tools:
+        body["tools"] = tools
 
     finish = None
     timings: dict = {}
+    calls: dict[int, dict] = {}
+    done = False
     with httpx.Client(timeout=httpx.Timeout(3600, connect=10), headers=auth_headers(api_key)) as client:
         with client.stream("POST", f"{url}/v1/chat/completions", json=body) as r:
             if r.status_code != 200:
@@ -113,6 +119,7 @@ def stream_chat(
                     continue
                 data = line[6:]
                 if data.strip() == "[DONE]":
+                    done = True
                     break
                 obj = json.loads(data)
                 if "timings" in obj:
@@ -121,8 +128,20 @@ def stream_chat(
                     d = ch.get("delta", {})
                     if ch.get("finish_reason"):
                         finish = ch["finish_reason"]
+                    for tc in d.get("tool_calls") or []:
+                        i = tc.get("index", 0)
+                        slot = calls.setdefault(i, {"id": f"call_{i}", "type": "function", "function": {"name": "", "arguments": ""}})
+                        if tc.get("id"):
+                            slot["id"] = tc["id"]
+                        f = tc.get("function") or {}
+                        slot["function"]["name"] += f.get("name") or ""
+                        slot["function"]["arguments"] += f.get("arguments") or ""
                     if d.get("content") or d.get("reasoning_content"):
                         yield Delta(content=d.get("content") or "", reasoning=d.get("reasoning_content") or "")
+    if calls:
+        if not done or finish not in {"tool_calls", "stop"}:
+            raise RuntimeError("incomplete tool-call response; no tools were executed")
+        yield Delta(tool_calls=[calls[i] for i in sorted(calls)])
     yield TurnStats.from_timings(timings, n_ctx, finish)
 
 

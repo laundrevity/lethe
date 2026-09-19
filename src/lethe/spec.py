@@ -16,7 +16,7 @@ from .ggufmeta import quant_from_filename
 from .hub import SHARD_RE
 from .paths import find_ggufs, models_dir, repo_dirname
 
-SIDECAR_RE = re.compile(r"^(mmproj|imatrix)|fastmtp|-draft", re.I)
+SIDECAR_RE = re.compile(r"^(mmproj|imatrix|mtp-)|fastmtp|-draft", re.I)
 
 
 def is_sidecar(name: str) -> bool:

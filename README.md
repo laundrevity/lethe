@@ -10,7 +10,7 @@ in use now: pid 13326 11.8 GiB (llama.cpp) · wired total 4.8 GiB
 ┃ spec (owner/repo:QUANT)                                              ┃     size ┃ quant  ┃ native ctx ┃ KV/tok ┃ mem @32K ┃ mem @128K ┃ mem @native ┃ max ctx here ┃
 │ HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF:Q8_K_P  │ 29.3 GiB │ Q8_K_P │    262,144 │ 64 KiB │ 31.3 GiB │  37.3 GiB │    45.3 GiB │      262,144 │
 
-$ uv run lethe chat
+$ uv run lethe                    # bare `lethe` = `lethe chat`
 context 262,144 (native max 262,144) · model 29.3 GiB + draft 862 MiB + KV 16.0 GiB (f16, 64 KiB/tok) = 46.1 GiB of 99.0 GiB free now
 speculative: FastMTP draft …FastMTP-32K.gguf (depth 3) · thinking on
 ready in 3.6s at http://127.0.0.1:8080 · n_ctx 262,144 · traceless: no log, no web UI, no slots endpoint
@@ -38,6 +38,7 @@ So the defaults are:
 | pid / state files | none | running servers are found via the process table |
 | network | `127.0.0.1` only | |
 | `chat` REPL | writes nothing; no history file (Up-arrow recall is in-memory only) | `/wipe` clears the conversation **and** the terminal scrollback |
+| shell tool | **off**; `chat --shell --shell-dir PATH` opts in | macOS sandbox: read-only workspace + system runtime, no network, confirmation for every command; command text and captured output stay in memory unless you save the conversation |
 | saved conversations | **off**; `chat --save` / `/save` opt in **per conversation** | AES-256-GCM, key from your passphrase via scrypt, passphrase never stored; random filenames, title/model inside the ciphertext; `lethe conversations` lists ids only (`--unlock` to see titles), `--delete` overwrites then removes |
 | clipboard | only on explicit `/copy` | clipboard managers and Universal Clipboard can persist or forward that, so it's never automatic |
 | Hugging Face | telemetry disabled; downloads anonymous unless the repo is gated | what you download is still visible to HF, as with any download |
@@ -49,6 +50,68 @@ files were fetched — no content). `lethe doctor` warns if a log exists. Outsid
 terminal's own scrollback (hence `/wipe`) and your shell history (which records the `lethe chat …`
 command, not what you typed into it).
 
+By default `chat` sends a short system prompt telling the model what it is (name, family, developer),
+what it runs on (chip, RAM), the current date and time (refreshed on `--resume`), that the
+conversation is local-only and unobserved, and that post-cutoff reality is real — without that last
+part, models tend to read genuine post-cutoff news as fiction or an evaluation scenario. `--system TEXT`
+replaces it; `--no-system` sends none.
+
+**Internet tools are the one opt-in exception to "nothing leaves the machine".** `chat --tools web,fetch`
+gives the model `web_search` (keyless ddgs metasearch over Google/Brave/Bing/Mojeek/…, or your own
+SearXNG via `--searx URL`) and `fetch_url` (page → markdown via trafilatura); `/web` in the REPL turns
+them on mid-conversation and `/web off` withdraws them (the default system prompt is patched to match). The model composes the
+queries and URLs from your conversation, so treat them as visible to the engines you hit. Every request
+is printed before it is sent; `--tools-confirm` additionally asks y/n per request. Results are chunked
+(~4K tokens; the model pages through long articles with an offset), never cached or written to disk,
+and every URL and redirect hop is checked for private/LAN addresses, with the connection pinned to the
+address that was checked (no DNS rebinding). The default system prompt stops claiming
+network silence when internet tools are on.
+
+## Sandboxed command-line tool
+
+```bash
+uv run lethe --shell --shell-dir ./src       # let the model inspect this directory
+uv run lethe --tools shell --shell-dir .     # inspect the whole project
+uv run lethe --shell --shell-dir . --web     # combine shell with the separate internet tools
+```
+
+The model gets `run_shell(command, cwd=".", timeout_seconds=10)`. It can use macOS commands such as
+`ls`, `find`, `grep`, `sed`, `awk`, and pipelines to explore files and compute answers. Before every
+execution, Lethe shows the workspace and **entire command**, then asks for confirmation (default: no).
+`--yes` only affects model downloads; shell approval is always required. `/shell` shows the scope;
+`/shell off` removes the tool. `/web off` only removes internet tools.
+
+This first version is **read-only**: even writes inside the selected directory are denied, including
+temporary files, installs, edits, deletes, and caches. The directory defaults to the current working
+directory; home and its parent directories are refused. Select the smallest useful directory: all
+files inside it, including `.env` or other secrets, are readable. Symlinks do not grant access to files
+outside the allowed paths. OS utilities, libraries, and limited system metadata are also readable.
+Homebrew programs, virtual environments whose interpreters live outside the workspace, and build tools
+that require scratch files may not work in this initial mode.
+
+Each call starts a fresh noninteractive `/bin/sh` with a fixed `/usr/bin:/bin` PATH, no inherited
+credentials/proxies/SSH agent, and no automatic shell startup files. The OS denies network access
+(including localhost and Unix sockets), writes, and access to other host processes. Commands receive
+a 10-second default wall-clock limit (maximum 30), hard CPU/file-size/file-descriptor limits, and a
+16,000-byte combined output cap. Results include `stdout`, `stderr`, `exit_code`, `timed_out`, and
+`truncated`; hitting the output cap stops the command. Normal child processes are killed with the
+command on timeout, overflow, or Ctrl-C. There are at most 8 tool rounds and 16 calls per user turn.
+
+Enforcement uses macOS `/usr/bin/sandbox-exec` (Seatbelt), with a real startup probe. Unsupported
+platforms or sandbox setup errors disable the shell tool; there is no unsandboxed fallback. Apple
+marks this interface deprecated, and it may stop working on a future macOS release. This is a
+filesystem/network boundary, **not a VM or a complete resource-isolation system**: memory and aggregate
+process count are not capped, and deliberately detached processes can escape process-group cleanup
+(they still inherit the sandbox). Background daemons and hostile-code analysis are unsupported.
+macOS itself may retain diagnostics; Lethe does not write command scripts, history, profiles, or output
+files. Enabling `--web` separately still allows the model to send queries/URLs to the internet, so shell
+read access and internet tools together can expose information from files in the chosen workspace.
+
+Run the ordinary tests with `uv run pytest`. To verify the actual OS restrictions on macOS, run
+`uv run pytest tests/test_shell.py --run-sandbox` from a normal terminal; nested sandboxes may prevent
+the startup probe. These tests check allowed reads/pipelines and denied writes, outside reads,
+symlink escapes, loopback/Unix sockets, host-process access, timeouts, and output flooding.
+
 ## Setup
 
 ```bash
@@ -57,7 +120,7 @@ scripts/build-llama.sh           # Metal + Accelerate, Release; applies model pa
 uv sync
 uv run lethe doctor              # confirms Metal is linked and reports the GPU memory budget
 uv run lethe default HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF:Q8_K_P
-uv run lethe chat                # downloads (with confirmation) on first use, then serves + chats
+uv run lethe                     # downloads (with confirmation) on first use, then serves + chats
 ```
 
 ## Models are `owner/repo:QUANT`
@@ -79,7 +142,7 @@ from the GGUF's architecture, following each model card's recommendations; overr
 | `lethe models` | the same table for what's on disk, plus what other model processes are holding right now |
 | `lethe default [spec]` | show / set the default model |
 | `lethe serve [spec] [--ctx N] [--kv q8_0] [--no-mtp] [--no-thinking] [--effort xhigh] [--vision]` | launch `llama-server` with the memory plan printed against what is *free now*; defaults to the native max context if it fits |
-| `lethe chat [spec] [-f FILE …] [--save] [--resume ID]` | streaming REPL; after every turn: prompt tok/s, gen tok/s, MTP acceptance, context used/total (colored; warns at 80%) |
+| `lethe [chat] [spec] [-f FILE …] [--save] [--resume ID] [--web] [--shell --shell-dir PATH] [--system TEXT] [--no-system]` (the command word is optional) | streaming REPL; after every turn: prompt tok/s, gen tok/s, MTP acceptance, context used/total (colored; warns at 80%) |
 | `lethe conversations [--unlock] [--delete ID]` | encrypted saved conversations |
 | `lethe bench [spec] [-d 0,32768]` | `llama-bench` prompt/gen speeds at context depth — **no speculative decoding, this is the floor** |
 | `lethe bench [spec] --server [-d 0,32768]` | through `llama-server`: no-MTP vs embedded MTP vs FastMTP, real tok/s and acceptance |
@@ -131,7 +194,7 @@ Acceptance (and therefore speed) depends on the text: 48% on free prose, 74% on 
 scripts/build-llama.sh   canonical build (flags documented inside)
 scripts/bump-llama.sh    move to latest upstream llama.cpp, re-apply the FastMTP patch, rebuild, verify
 src/lethe/               cli.py · repl.py · server.py · chat.py · spec.py · profiles.py · vault.py ·
-                         attachments.py · benchserver.py · hub.py · ggufmeta.py · sysinfo.py · config.py · paths.py
+                         tools.py · shell.py · attachments.py · benchserver.py · hub.py · ggufmeta.py · sysinfo.py · config.py · paths.py
 tests/                   pytest (uv run pytest)
 vendor/llama.cpp         submodule; the FastMTP patch is committed on local branch `lethe-fastmtp`
 models/                  downloaded GGUFs (gitignored)

@@ -17,6 +17,7 @@ class Profile:
     instruct: dict  # sampler when reasoning is off
     supports_thinking: bool = True
     disable_thinking_kwargs: dict = field(default_factory=lambda: {"enable_thinking": False})
+    developer: str = ""  # who trained the base model family, for the default system prompt
     notes: str = ""
 
     def sampling(self, thinking: bool) -> dict:
@@ -27,30 +28,35 @@ _QWEN3 = Profile(
     "qwen3",
     thinking={"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 0.0, "repeat_penalty": 1.0},
     instruct={"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5, "repeat_penalty": 1.0},
+    developer="the Qwen team at Alibaba Cloud",
     notes="Qwen3.x model card: thinking temp 1.0/top_p 0.95/top_k 20; non-thinking temp 0.7/top_p 0.8/presence 1.5",
 )
 _GEMMA = Profile(
     "gemma",
     thinking={"temperature": 1.0, "top_p": 0.95, "top_k": 64, "min_p": 0.0, "repeat_penalty": 1.0},
     instruct={"temperature": 1.0, "top_p": 0.95, "top_k": 64, "min_p": 0.0, "repeat_penalty": 1.0},
+    developer="Google DeepMind",
     notes="Gemma model card: temp 1.0/top_p 0.95/top_k 64",
 )
 _MINIMAX = Profile(
     "minimax-m2",
     thinking={"temperature": 1.0, "top_p": 0.95, "top_k": 40, "min_p": 0.0, "repeat_penalty": 1.0},
     instruct={"temperature": 1.0, "top_p": 0.95, "top_k": 40, "min_p": 0.0, "repeat_penalty": 1.0},
+    developer="MiniMax",
     notes="MiniMax-M2 model card: temp 1.0/top_p 0.95/top_k 40; the model always thinks",
 )
 _DEEPSEEK = Profile(
     "deepseek",
     thinking={"temperature": 0.6, "top_p": 0.95, "top_k": 0, "min_p": 0.0, "repeat_penalty": 1.0},
     instruct={"temperature": 0.6, "top_p": 0.95, "top_k": 0, "min_p": 0.0, "repeat_penalty": 1.0},
+    developer="DeepSeek",
     notes="DeepSeek R1/V3 guidance: temp 0.6/top_p 0.95",
 )
 _GLM = Profile(
     "glm",
     thinking={"temperature": 1.0, "top_p": 0.95, "top_k": 40, "min_p": 0.0, "repeat_penalty": 1.0},
     instruct={"temperature": 1.0, "top_p": 0.95, "top_k": 40, "min_p": 0.0, "repeat_penalty": 1.0},
+    developer="Zhipu AI",
     notes="GLM-4.5 model card: temp 1.0/top_p 0.95",
 )
 _DEFAULT = Profile(

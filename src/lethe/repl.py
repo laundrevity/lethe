@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 import time
@@ -9,25 +10,43 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from rich.console import Console
+from rich.prompt import Confirm
 
-from . import vault
+from . import tools as T, vault
 from .attachments import UnsupportedFile, approx_tokens, file_block, image_data_url, is_image
 from .chat import Delta, TurnStats, complete, stream_chat
 from .profiles import Profile, describe
 
 con = Console()
+MAX_TOOL_ROUNDS = 8
+MAX_TOOL_CALLS = 16
+_DISPLAY_ESCAPES = {
+    code: f"\\x{code:02x}" for code in [*range(32), *range(127, 160)] if code not in (9, 10)
+}
+_DISPLAY_ESCAPES.update({code: f"\\u{code:04x}" for code in [*range(0x202A, 0x202F), *range(0x2066, 0x206A)]})
+
+
+def _terminal_safe(text: str) -> str:
+    """Keep model/file text from controlling the terminal around approval prompts.
+
+    Applied per chunk, so even split escape sequences stay inert. The original
+    text remains in the conversation; only its terminal presentation is escaped.
+    """
+    return text.translate(_DISPLAY_ESCAPES)
 
 HELP = """\
 /quit          leave (Ctrl-D too)
 /reset         clear the conversation (server KV cache is reused only for shared prefixes)
 /wipe          clear the conversation AND the terminal scrollback
 /copy          copy the last reply (without reasoning) to the clipboard
-/file PATH     attach a text/PDF file to your next message (also: lethe chat -f PATH)
+/file PATH     attach a text/PDF file to your next message (also: lethe -f PATH)
 /image PATH    attach an image to your next message (needs `serve --vision`)
 /think on|off  toggle reasoning mode (switches the sampler preset too)
 /compact       summarize the conversation so far with the model and continue from the summary
 /save          start saving this conversation, encrypted, to .lethe/conversations/ (asks for a passphrase)
 /stats         last turn's throughput/context line
+/web [off]     enable internet tools mid-chat (search + page fetch; every request is printed) — or launch with --web
+/shell [off]   show shell status or disable it (enable at launch with --shell --shell-dir PATH)
 Enter sends · Ctrl+Enter / Ctrl+J / \\+Enter add a line · paste multi-line freely · Ctrl-C interrupts a reply"""
 
 
@@ -48,6 +67,9 @@ class ReplConfig:
     save: bool = False
     resume: vault.Conversation | None = None
     passphrase: str | None = None
+    tools: dict = field(default_factory=dict)  # name -> tools.Tool; empty = no model tools
+    tools_confirm: bool = False
+    searx: str | None = None  # so /web can build the registry mid-session with the launch-time backend
 
 
 def _make_reader():
@@ -136,11 +158,52 @@ def _user_content(text: str, files: list[Path], images: list[Path]) -> str | lis
     return parts
 
 
+def _sync_tool_prompt(messages: list[dict], cfg: ReplConfig) -> None:
+    for message in messages:
+        if message["role"] == "system" and isinstance(message["content"], str):
+            message["content"] = T.sync_system_text(message["content"], cfg.tools)
+
+
+def _invoke_tool(cfg: ReplConfig, name: str, arguments: str) -> str:
+    tool = cfg.tools.get(name)
+    if tool is None:
+        return f"unknown or disabled tool {name}"
+    try:
+        args = tool.parse_arguments(arguments)
+    except (ValueError, TypeError) as e:
+        return f"invalid tool arguments: {e}"
+    # Approval must cover the entire command. Escape control characters and turn
+    # off Rich markup so model text cannot hide or restyle what is being approved.
+    if tool.confirmation_context:
+        con.print(tool.confirmation_context, style="dim", markup=False, highlight=False)
+    con.print("⚙ " + T.describe_call(name, arguments, full=True), style="cyan", markup=False, highlight=False)
+    if cfg.tools_confirm or tool.requires_confirmation:
+        try:
+            approved = Confirm.ask("  run this tool?", default=False)
+        except EOFError:
+            approved = False
+        if not approved:
+            return "the user declined this request"
+    try:
+        return tool.fn(**args)
+    except Exception as e:  # noqa: BLE001 — give the model the error, never bypass a failed sandbox
+        return f"error: {e}"
+
+
 def run(cfg: ReplConfig) -> None:
     conv = cfg.resume or vault.Conversation.new(cfg.model_spec)
     messages: list[dict] = list(conv.messages)
     if cfg.system and not any(m["role"] == "system" for m in messages):
         messages.insert(0, {"role": "system", "content": cfg.system})
+    sysmsg = next((m for m in messages if m["role"] == "system"), None)
+    if cfg.resume and sysmsg and isinstance(sysmsg["content"], str):
+        # a saved conversation carries its original system prompt; don't let it resurrect a stale "today"
+        sysmsg["content"] = re.sub(
+            r"(?m)^Current date and time at launch: .*$",
+            time.strftime("Current date and time at launch: %A %Y-%m-%d %H:%M %Z."),
+            sysmsg["content"],
+        )
+    _sync_tool_prompt(messages, cfg)
     thinking = cfg.thinking
     sampling = {**cfg.profile.sampling(thinking), **cfg.sampling_overrides}
     kwargs = None if (thinking or not cfg.profile.supports_thinking) else cfg.profile.disable_thinking_kwargs
@@ -157,13 +220,23 @@ def run(cfg: ReplConfig) -> None:
         + (f" · {len(pending_files)} file(s) attached to the first message" if pending_files else "")
         + (f" · resumed {conv.id}: {conv.turns} turns" if cfg.resume else "")
         + (" · [yellow]saving encrypted[/]" if saving else "")
+        + (f" · [yellow]tools ON: {', '.join(cfg.tools)}[/]" if cfg.tools else "")
         + " · /help for commands[/]"
     )
+    if "run_shell" in cfg.tools:
+        con.print("shell: read-only, network blocked, confirmation required for every command", style="yellow")
     if cfg.resume:
-        for m in messages[-2:]:
-            if m["role"] in ("user", "assistant"):
-                c = m["content"] if isinstance(m["content"], str) else "[multimodal]"
-                con.print(f"[dim]{m['role']} › {c[:200]}{'…' if len(c) > 200 else ''}[/]")
+        for m in messages:
+            if m["role"] == "user":
+                c = m["content"]
+                if not isinstance(c, str):
+                    texts = [p.get("text", "") for p in c if p.get("type") == "text"]
+                    n_img = sum(1 for p in c if p.get("type") == "image_url")
+                    c = "\n".join(t for t in texts if t) + (f" [{n_img} image(s)]" if n_img else "")
+                sys.stdout.write(f"\x1b[1;36myou ›\x1b[0m {_terminal_safe(c)}\n")
+            elif m["role"] == "assistant" and isinstance(m["content"], str):
+                sys.stdout.write(f"{_terminal_safe(m['content'])}\n\n")
+        sys.stdout.flush()
 
     def persist():
         nonlocal passphrase, saving
@@ -241,7 +314,7 @@ def run(cfg: ReplConfig) -> None:
                     if passphrase:
                         saving = True
                         persist()
-                        con.print(f"[yellow]saving encrypted as {conv.id}[/] → resume with: lethe chat --resume {conv.id}")
+                        con.print(f"[yellow]saving encrypted as {conv.id}[/] → resume with: lethe --resume {conv.id}")
             elif cmd == "compact":
                 if not any(m["role"] == "user" for m in messages):
                     con.print("[dim]nothing to compact[/]")
@@ -263,6 +336,24 @@ def run(cfg: ReplConfig) -> None:
                 ]
                 con.print(f"[dim]compacted to ~{approx_tokens(summary):,} tokens of summary[/]")
                 persist()
+            elif cmd == "web":
+                if arg == "off":
+                    for name in T.WEB_TOOL_NAMES:
+                        cfg.tools.pop(name, None)
+                    con.print("[dim]internet tools off[/]")
+                else:
+                    cfg.tools.update(T.build_registry(["web"], searx=cfg.searx))
+                    con.print("[yellow]internet tools ON: web_search, fetch_url — model-composed queries/URLs will leave this machine; every request is printed[/]")
+                _sync_tool_prompt(messages, cfg)
+            elif cmd == "shell":
+                if arg == "off":
+                    cfg.tools.pop("run_shell", None)
+                    _sync_tool_prompt(messages, cfg)
+                    con.print("[dim]shell tool off[/]")
+                elif "run_shell" in cfg.tools:
+                    con.print(cfg.tools["run_shell"].description, markup=False)
+                else:
+                    con.print("[dim]shell tool off — enable at launch with --shell --shell-dir PATH[/]")
             else:
                 con.print("[dim]unknown command — /help[/]")
             continue
@@ -273,35 +364,69 @@ def run(cfg: ReplConfig) -> None:
             con.print(f"[red]{e}[/]")
             continue
         pending_files, pending_images = [], []
+        turn_start = len(messages)
         messages.append({"role": "user", "content": content})
-        reply, in_reasoning, t0 = [], False, time.time()
+        tool_specs = [t.spec() for t in cfg.tools.values()] or None
+        round_text: list[str] = []
+        in_reasoning, t0, rounds, calls_used = False, time.time(), 0, 0
         try:
-            for ev in stream_chat(cfg.url, messages, n_ctx=cfg.n_ctx, sampling=sampling, max_tokens=cfg.max_tokens, chat_template_kwargs=kwargs, api_key=cfg.api_key):
-                if isinstance(ev, TurnStats):
-                    last = ev
-                    continue
-                if ev.reasoning and cfg.show_thinking:
-                    if not in_reasoning:
-                        sys.stdout.write("\x1b[2;3mthinking…\x1b[23m ")
-                        in_reasoning = True
-                    sys.stdout.write(ev.reasoning)
-                if ev.content:
-                    if in_reasoning:
-                        sys.stdout.write("\x1b[0m\n")
-                        in_reasoning = False
-                    reply.append(ev.content)
-                    sys.stdout.write(ev.content)
-                sys.stdout.flush()
+            while True:
+                round_text, pending_calls = [], None
+                for ev in stream_chat(cfg.url, messages, n_ctx=cfg.n_ctx, sampling=sampling, max_tokens=cfg.max_tokens, chat_template_kwargs=kwargs, api_key=cfg.api_key, tools=tool_specs):
+                    if isinstance(ev, TurnStats):
+                        last = ev
+                        continue
+                    if ev.tool_calls:
+                        pending_calls = ev.tool_calls
+                        continue
+                    if ev.reasoning and cfg.show_thinking:
+                        if not in_reasoning:
+                            sys.stdout.write("\x1b[2;3mthinking…\x1b[23m ")
+                            in_reasoning = True
+                        sys.stdout.write(_terminal_safe(ev.reasoning))
+                    if ev.content:
+                        if in_reasoning:
+                            sys.stdout.write("\x1b[0m\n")
+                            in_reasoning = False
+                        round_text.append(ev.content)
+                        sys.stdout.write(_terminal_safe(ev.content))
+                    sys.stdout.flush()
+                if in_reasoning:
+                    sys.stdout.write("\x1b[0m\n")
+                    in_reasoning = False
+                if not pending_calls:
+                    break
+                messages.append({"role": "assistant", "content": "".join(round_text) or None, "tool_calls": pending_calls})
+                if tool_specs is None:
+                    for call in pending_calls:
+                        messages.append({"role": "tool", "tool_call_id": call["id"], "name": call["function"]["name"],
+                                         "content": "tool execution disabled or tool-call limit reached"})
+                    round_text = ["Stopped: the model requested tools after they were disabled or the tool-call limit was reached."]
+                    con.print(round_text[0], style="yellow")
+                    break  # a model ignoring withdrawn tools must not create an infinite loop
+                rounds += 1
+                for call in pending_calls:
+                    name, arguments = call["function"]["name"], call["function"]["arguments"]
+                    if calls_used >= MAX_TOOL_CALLS:
+                        result = "tool-call limit reached: answer with what you have"
+                    else:
+                        calls_used += 1
+                        result = _invoke_tool(cfg, name, arguments)
+                    con.print(f"[dim]  → {len(result):,} chars[/]")
+                    messages.append({"role": "tool", "tool_call_id": call["id"], "name": name, "content": result})
+                if rounds >= MAX_TOOL_ROUNDS or calls_used >= MAX_TOOL_CALLS:
+                    con.print("[yellow]tool-call limit reached; requesting a final answer[/]")
+                    tool_specs = None
         except KeyboardInterrupt:
             con.print("\n[yellow]interrupted[/]")
+            del messages[turn_start:]
+            continue
         except Exception as e:  # noqa: BLE001
             con.print(f"\n[red]{e}[/]")
-            messages.pop()
+            del messages[turn_start:]
             continue
-        if in_reasoning:
-            sys.stdout.write("\x1b[0m\n")
         con.print()
-        last_reply = "".join(reply)
+        last_reply = "".join(round_text)
         messages.append({"role": "assistant", "content": last_reply})
         if last:
             con.print(f"[dim]{last.line()} · wall {time.time() - t0:.1f}s[/]")
@@ -312,4 +437,4 @@ def run(cfg: ReplConfig) -> None:
         persist()
         con.print()
     if saving:
-        con.print(f"[dim]saved {conv.id} · resume with: lethe chat --resume {conv.id}[/]")
+        con.print(f"[dim]saved {conv.id} · resume with: lethe --resume {conv.id}[/]")

@@ -13,13 +13,13 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import config, hub, server, spec as S, vault
+from . import config, hub, server, spec as S, tools as T, vault
 from .ggufmeta import ModelShape, parse_local, quant_from_filename, shape_from_kv
 from .paths import llama_bin, llama_dir, models_dir
 from .profiles import profile_for
 from .sysinfo import GiB, fmt_bytes, llama_processes, machine, wired_bytes
 
-app = typer.Typer(add_completion=False, no_args_is_help=True, rich_markup_mode="rich")
+app = typer.Typer(add_completion=False, rich_markup_mode="rich", help="Bare `lethe …` (no command) runs `lethe chat …` — e.g. `lethe --web` chats with internet tools. See `lethe chat --help` for all chat flags.")
 con = Console()
 err = Console(stderr=True)
 
@@ -29,6 +29,32 @@ MODEL_HELP = "Model: owner/repo:QUANT (canonical), a .gguf path, or a unique sub
 
 
 # ----------------------------------------------------------------------------- helpers
+
+
+def _default_system(lm: S.LocalModel, shape: ModelShape, net_tools: bool = False) -> str:
+    """Ground the model in its actual situation: what it is, whose machine this is, and that nobody is listening."""
+    m = machine()
+    prof = profile_for(shape)
+    ident = shape.name or str(lm.spec)
+    bits = [b for b in (f"{shape.params_b:g}B parameters" if shape.params_b else "", shape.quant or "") if b]
+    ident += f" ({', '.join(bits)})" if bits else ""
+    lineage = f", based on the {prof.name} model family by {prof.developer}" if prof.developer else ""
+    owner = str(lm.spec).split("/")[0]
+    tuned = f", packaged by {owner}" if prof.developer and owner.lower() not in prof.developer.lower() else ""
+    return (
+        f"You are {ident}{lineage}{tuned}. You are running entirely locally on the user's own computer — "
+        f"an {m.chip} with {m.total_ram // GiB} GB of unified memory — via llama.cpp under lethe, a private, logless runner.\n"
+        + time.strftime("Current date and time at launch: %A %Y-%m-%d %H:%M %Z.\n")
+        + "Your training data ends well before this date; assume the world has moved on in ways you do not yet know. "
+        "This is a real private session with a real person — not a test, an evaluation, or roleplay — so treat surprising "
+        "post-cutoff information (unfamiliar events, products, model names) as genuine news, not as fiction or a scenario.\n"
+        + "This conversation happens in a vacuum: inference is on-device, and nothing is "
+        + (T.VACUUM_CLAIM if not net_tools else "")
+        + "logged or retained after the process exits (unless the user explicitly saves the conversation, encrypted, to their "
+        "own disk). There is no telemetry, moderation layer, or observer of any kind; no company or third party — including "
+        "the model's developers — can see any of this. It is just you and the user. Speak plainly and candidly."
+        + (T.SYSTEM_NOTE if net_tools else "")
+    )
 
 
 def _shape(path: Path) -> ModelShape:
@@ -41,9 +67,9 @@ def _fit_row(shape: ModelShape | None, size: int, budget: int, kvb: float) -> di
     per = shape.kv_bytes_per_token(kvb)
     cols = []
     for c in CTX_COLUMNS:
-        tot = size + per * c
+        tot = size + shape.kv_bytes(c, kvb)
         cols.append(("[green]" if tot <= budget else "[red]") + fmt_bytes(tot) + "[/]")
-    nat = size + per * shape.n_ctx_train
+    nat = size + shape.kv_bytes(shape.n_ctx_train, kvb)
     max_ctx = min(shape.n_ctx_train, shape.max_ctx_for(budget, size, kvb))
     return {
         "kv_tok": f"{per / 1024:.0f} KiB",
@@ -129,7 +155,7 @@ def _pull(repo: str, g: hub.HubGguf, ggufs: list[hub.HubGguf], sidecars: bool = 
 def _find_sidecar(lm: S.LocalModel, kind: str) -> Path | None:
     for p in lm.path.parent.glob("*.gguf"):
         n = p.name.lower()
-        if kind == "draft" and "fastmtp" in n:
+        if kind == "draft" and ("fastmtp" in n or n.startswith("mtp-")):
             return p
         if kind == "mmproj" and n.startswith("mmproj"):
             return p
@@ -151,14 +177,16 @@ def _plan_ctx(shape: ModelShape, size: int, ctx: int, kv: str, draft_size: int) 
         if ctx > max_fit:
             ctx = max(4096, (max_fit // 4096) * 4096)
             con.print(f"[yellow]native context {shape.n_ctx_train:,} does not fit in what's free; using {ctx:,}[/]")
-    kv_total = per * ctx
+    kv_total = shape.kv_bytes(ctx, kvb)
     total = fixed + kv_total
     color = "green" if total <= budget else "red"
     con.print(
         f"context [bold]{ctx:,}[/] (native max {shape.n_ctx_train:,}) · "
         f"model {fmt_bytes(size)}"
         + (f" + draft {fmt_bytes(draft_size)}" if draft_size else "")
-        + f" + KV {fmt_bytes(kv_total)} ({kv}, {per / 1024:.0f} KiB/tok) = [{color}]{fmt_bytes(total)}[/]"
+        + f" + KV {fmt_bytes(kv_total)} ({kv}, {per / 1024:.0f} KiB/tok"
+        + (f" + {fmt_bytes(shape.kv_fixed_bytes(kvb))} in {shape.n_swa_layers} sliding-window layers" if shape.swa_window else "")
+        + f") = [{color}]{fmt_bytes(total)}[/]"
         + f" of {fmt_bytes(available)} free now ({fmt_bytes(capacity)} capacity)"
     )
     if available < capacity - 2 * GiB:
@@ -313,8 +341,9 @@ def browse(
     con.print(t)
     if shared:
         con.print(
-            f"[dim]{shared.name}: {shared.n_layer} layers, {shared.n_attn_layers} with KV cache"
-            f"{' (hybrid: interval ' + str(shared.extra.get('full_attention_interval')) + ')' if shared.n_attn_layers != shared.n_layer else ''}, "
+            f"[dim]{shared.name}: {shared.n_layer} layers, {shared.n_attn_layers} with growing KV"
+            + (f" + {shared.n_swa_layers} sliding-window ({shared.swa_window} tok)" if shared.swa_window else "")
+            + f"{' (hybrid: interval ' + str(shared.extra.get('full_attention_interval')) + ')' if not shared.swa_window and shared.n_attn_layers != shared.n_layer else ''}, "
             f"{shared.n_head_kv} KV heads × {shared.key_len}+{shared.val_len}"
             f"{', MTP head' if shared.has_mtp else ''}"
             f"{', MoE ' + str(shared.extra.get('expert_used_count')) + '/' + str(shared.extra.get('expert_count')) if shared.extra.get('expert_count') else ''}"
@@ -452,6 +481,13 @@ def chat(
     top_p: Optional[float] = typer.Option(None, help="Override top_p"),
     top_k: Optional[int] = typer.Option(None, help="Override top_k"),
     min_p: Optional[float] = typer.Option(None, help="Override min_p"),
+    no_system: bool = typer.Option(False, "--no-system", help="No system prompt at all (default: a short one grounding the model: local, private, this hardware)"),
+    web: bool = typer.Option(False, "--web", help="Shorthand for --tools web,fetch: let the model search the web and read pages"),
+    tools: Optional[str] = typer.Option(None, "--tools", help="OPT-IN model tools, comma-separated: web,fetch,shell. Web queries/URLs leave this machine; shell is read-only and offline"),
+    shell: bool = typer.Option(False, "--shell", help="Enable a read-only, offline macOS shell tool; always asks before running commands"),
+    shell_dir: Optional[Path] = typer.Option(None, "--shell-dir", help="Directory the shell may read (default: current directory); requires --shell or --tools shell"),
+    searx: Optional[str] = typer.Option(None, "--searx", help="Back web search with this SearXNG instance URL instead of the ddgs metasearch"),
+    tools_confirm: bool = typer.Option(False, "--tools-confirm", help="Ask y/n before every tool call (shell commands always ask)"),
     save: bool = typer.Option(False, "--save", help="OPT-IN: save this conversation encrypted (asks for a passphrase)"),
     resume: Optional[str] = typer.Option(None, "--resume", help="Resume a saved conversation by id (see lethe conversations)"),
     port: int = typer.Option(server.DEFAULT_PORT),
@@ -461,6 +497,24 @@ def chat(
     for f in file:
         if not f.is_file():
             err.print(f"[red]no such file: {f}[/]")
+            raise typer.Exit(1)
+    tool_names = [t.strip() for t in (tools or "").split(",") if t.strip()]
+    if web:
+        tool_names.append("web")
+    if shell:
+        tool_names.append("shell")
+    if shell_dir is not None and "shell" not in tool_names:
+        err.print("--shell-dir requires --shell or --tools shell", style="red")
+        raise typer.Exit(1)
+    tool_registry: dict = {}
+    if tool_names:
+        try:
+            tool_registry = T.build_registry(tool_names, searx=searx, shell_dir=shell_dir)
+        except KeyError as e:
+            err.print(f"unknown tool {e} — available: web, fetch, shell", style="red", markup=False)
+            raise typer.Exit(1)
+        except (OSError, ValueError, RuntimeError) as e:
+            err.print(str(e), style="red", markup=False)
             raise typer.Exit(1)
     resumed: vault.Conversation | None = None
     passphrase: str | None = None
@@ -494,7 +548,7 @@ def chat(
     elif not rec:
         dflt = config.default_model()
         if not dflt:
-            err.print("[red]no server running, no model given, no default set[/] — lethe chat owner/repo:QUANT")
+            err.print("[red]no server running, no model given, no default set[/] — lethe owner/repo:QUANT")
             raise typer.Exit(1)
         lm = _resolve_or_offer(dflt, yes)
         rec = _launch(lm, ctx=ctx, kv=kv, mtp=True, draft=True, draft_n=3, vision=vision, thinking=thinking, effort=None,
@@ -509,11 +563,15 @@ def chat(
 
     from .repl import ReplConfig, run
 
+    sh = _shape(lm.path)
+    if system is None and not no_system:
+        system = T.sync_system_text(_default_system(lm, sh), tool_registry)
     run(ReplConfig(
-        url=rec["url"], api_key=api_key, n_ctx=n_ctx, model_spec=lm.spec, profile=profile_for(_shape(lm.path)),
+        url=rec["url"], api_key=api_key, n_ctx=n_ctx, model_spec=lm.spec, profile=profile_for(sh),
         thinking=thinking, show_thinking=show_thinking, system=system, max_tokens=max_tokens,
         sampling_overrides=overrides, attachments=list(file), vision=has_vision,
         save=save, resume=resumed, passphrase=passphrase,
+        tools=tool_registry, tools_confirm=tools_confirm, searx=searx,
     ))
 
 
@@ -528,7 +586,7 @@ def conversations(
         return
     entries = vault.list_entries()
     if not entries:
-        con.print("[dim]no saved conversations (saving is opt-in: lethe chat --save)[/]")
+        con.print("[dim]no saved conversations (saving is opt-in: lethe --save)[/]")
         return
     passphrase = None
     if unlock:
@@ -553,7 +611,7 @@ def conversations(
                 row += ["[red]wrong passphrase[/]", "", ""]
         t.add_row(*row)
     con.print(t)
-    con.print("[dim]resume: lethe chat --resume <id> · delete: lethe conversations --delete <id>[/]")
+    con.print("[dim]resume: lethe --resume <id> · delete: lethe conversations --delete <id>[/]")
 
 
 @app.command()
@@ -621,5 +679,14 @@ def traces(delete: bool = typer.Option(False, "--delete", help="Delete what is f
             shutil.rmtree(p) if p.is_dir() else p.unlink()
 
 
+def main() -> None:
+    """Entry point. Bare `lethe [chat args…]` means `lethe chat …` — chat is what you run 95% of the time."""
+    argv = sys.argv[1:]
+    commands = typer.main.get_command(app).commands  # type: ignore[union-attr]
+    if not argv or (argv[0] not in commands and argv[0] != "--help"):
+        argv = ["chat", *argv]
+    app(argv)
+
+
 if __name__ == "__main__":
-    app()
+    main()
