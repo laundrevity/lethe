@@ -17,6 +17,7 @@ from . import config, hub, server, spec as S, tools as T, vault
 from .ggufmeta import ModelShape, parse_local, quant_from_filename, shape_from_kv
 from .paths import llama_bin, llama_dir, models_dir
 from .profiles import profile_for
+from .shell import ShellMode
 from .sysinfo import GiB, fmt_bytes, llama_processes, machine, wired_bytes
 
 app = typer.Typer(add_completion=False, rich_markup_mode="rich", help="Bare `lethe …` (no command) runs `lethe chat …` — e.g. `lethe --web` chats with internet tools. See `lethe chat --help` for all chat flags.")
@@ -50,9 +51,7 @@ def _default_system(lm: S.LocalModel, shape: ModelShape, net_tools: bool = False
         "post-cutoff information (unfamiliar events, products, model names) as genuine news, not as fiction or a scenario.\n"
         + "This conversation happens in a vacuum: inference is on-device, and nothing is "
         + (T.VACUUM_CLAIM if not net_tools else "")
-        + "logged or retained after the process exits (unless the user explicitly saves the conversation, encrypted, to their "
-        "own disk). There is no telemetry, moderation layer, or observer of any kind; no company or third party — including "
-        "the model's developers — can see any of this. It is just you and the user. Speak plainly and candidly."
+        + T.PRIVACY_NOTE
         + (T.SYSTEM_NOTE if net_tools else "")
     )
 
@@ -483,9 +482,10 @@ def chat(
     min_p: Optional[float] = typer.Option(None, help="Override min_p"),
     no_system: bool = typer.Option(False, "--no-system", help="No system prompt at all (default: a short one grounding the model: local, private, this hardware)"),
     web: bool = typer.Option(False, "--web", help="Shorthand for --tools web,fetch: let the model search the web and read pages"),
-    tools: Optional[str] = typer.Option(None, "--tools", help="OPT-IN model tools. Bare --tools = the read-only, offline shell (so --web --tools = internet + shell); or name them: web,fetch,shell"),
-    shell: bool = typer.Option(False, "--shell", help="Enable a read-only, offline macOS shell tool; always asks before running commands"),
-    shell_dir: Optional[Path] = typer.Option(None, "--shell-dir", help="Directory the shell may read (default: current directory); requires --shell or --tools shell"),
+    tools: Optional[str] = typer.Option(None, "--tools", help="OPT-IN model tools. Bare --tools = shell (read-only/offline unless --shell-mode full); or name them: web,fetch,shell. Composes with --web"),
+    shell: bool = typer.Option(False, "--shell", help="Enable the shell tool (read-only/offline unless --shell-mode full); always asks before running commands"),
+    shell_dir: Optional[Path] = typer.Option(None, "--shell-dir", help="Shell workspace or, in full mode, starting directory (default: current directory); requires --shell or --tools shell"),
+    shell_mode: ShellMode = typer.Option(ShellMode.READ_ONLY, "--shell-mode", help="read-only: offline macOS sandbox. full: run as you, with writes, network, inherited PATH/environment and credentials; requires --tools or --shell"),
     searx: Optional[str] = typer.Option(None, "--searx", help="Back web search with this SearXNG instance URL instead of the ddgs metasearch"),
     tools_confirm: bool = typer.Option(False, "--tools-confirm", help="Ask y/n before every tool call (shell commands always ask)"),
     save: bool = typer.Option(False, "--save", help="OPT-IN: save this conversation encrypted (asks for a passphrase)"),
@@ -506,10 +506,13 @@ def chat(
     if shell_dir is not None and "shell" not in tool_names:
         err.print("--shell-dir requires --tools or --shell", style="red")
         raise typer.Exit(1)
+    if shell_mode == ShellMode.FULL and "shell" not in tool_names:
+        err.print("--shell-mode full requires --tools or --shell", style="red")
+        raise typer.Exit(1)
     tool_registry: dict = {}
     if tool_names:
         try:
-            tool_registry = T.build_registry(tool_names, searx=searx, shell_dir=shell_dir)
+            tool_registry = T.build_registry(tool_names, searx=searx, shell_dir=shell_dir, shell_mode=shell_mode)
         except KeyError as e:
             err.print(f"unknown tool {e} — available: web, fetch, shell", style="red", markup=False)
             raise typer.Exit(1)
@@ -572,6 +575,7 @@ def chat(
         sampling_overrides=overrides, attachments=list(file), vision=has_vision,
         save=save, resume=resumed, passphrase=passphrase,
         tools=tool_registry, tools_confirm=tools_confirm, searx=searx,
+        shell_dir=(shell_dir if shell_dir is not None else Path.cwd()).expanduser().resolve(),
     ))
 
 

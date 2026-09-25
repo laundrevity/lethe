@@ -79,6 +79,78 @@ def test_environment_and_launch_are_fixed(tmp_path, monkeypatch):
     assert env["PATH"] == "/usr/bin:/bin"
 
 
+def test_full_shell_writes_and_inherits_environment_outside_starting_directory(tmp_path, monkeypatch):
+    root = tmp_path / "project"
+    root.mkdir()
+    bindir = tmp_path / "tools"
+    bindir.mkdir()
+    helper = bindir / "lethe-test-helper"
+    helper.write_text('#!/bin/sh\nprintf "%s" "$LETHE_TEST_VALUE"\n')
+    helper.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:/usr/bin:/bin")
+    monkeypatch.setenv("LETHE_TEST_VALUE", "inherited-value")
+    monkeypatch.setattr(shell, "SANDBOX_EXEC", tmp_path / "no-sandbox-exec")
+    full = shell.FullShell(root)
+    full.check_available()
+    result = full.execute("lethe-test-helper > written; cat written", cwd="..")
+    assert result["exit_code"] == 0 and result["stdout"] == "inherited-value"
+    assert (tmp_path / "written").read_text() == "inherited-value"
+    assert full.execute("pwd", cwd=str(tmp_path))["stdout"].strip() == str(tmp_path.resolve())
+    assert full.execute("pwd", cwd="~")["stdout"].strip() == str(Path.home().resolve())
+    assert shell.FullShell(Path.home()).root == Path.home().resolve()
+
+
+def test_full_shell_uses_longer_timeouts_without_sandbox_limits(tmp_path, monkeypatch):
+    captured = []
+    monkeypatch.setattr(shell, "_run_bounded", lambda *args, **kw: captured.append((args, kw)))
+    full = shell.FullShell(tmp_path)
+    full.execute("printf test")
+    full.execute("printf test", timeout_seconds=600)
+    for (argv, script, cwd, env, timeout), kwargs in captured:
+        assert argv == ["/bin/sh", "-s"] and script == b"printf test\n"
+        assert env["HISTFILE"] == "/dev/null"
+        assert kwargs == {"stop_on_output_limit": False}
+    assert [args[-1] for args, kw in captured] == [120, 600]
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"command": ""}, {"command": "\0"}, {"command": 5}, {"command": "x" * 8001},
+    {"command": "true", "timeout_seconds": 0}, {"command": "true", "timeout_seconds": 601},
+    {"command": "true", "timeout_seconds": True}, {"command": "true", "timeout_seconds": 1.5},
+    {"command": "true", "cwd": "\0"}, {"command": "true", "cwd": 1},
+])
+def test_full_shell_validates_arguments_before_execution(tmp_path, monkeypatch, kwargs):
+    monkeypatch.setattr(shell, "_run_bounded", lambda *a, **kw: pytest.fail("must never launch"))
+    with pytest.raises(ValueError):
+        shell.FullShell(tmp_path).execute(**kwargs)
+
+
+def test_full_shell_keeps_running_after_output_is_truncated(tmp_path):
+    result = shell.FullShell(tmp_path).execute(
+        "i=0; while [ $i -lt 4000 ]; do printf 'verbose build output\\n'; i=$((i+1)); done\n"
+        "printf finished > result.txt"
+    )
+    assert result["exit_code"] == 0 and result["truncated"] and not result["timed_out"]
+    assert len(result["stdout"].encode()) + len(result["stderr"].encode()) == shell.MAX_OUTPUT_BYTES
+    assert (tmp_path / "result.txt").read_text() == "finished"
+    result = shell.FullShell(tmp_path).execute("yes output", timeout_seconds=1)
+    assert result["truncated"] and result["timed_out"]
+
+
+def test_full_shell_allows_loopback(request, tmp_path):
+    if not request.config.getoption("--run-sandbox"):
+        pytest.skip("real shell networking test: pass --run-sandbox outside any outer sandbox")
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        result = shell.FullShell(tmp_path).execute(f"/usr/bin/nc -z -w 2 127.0.0.1 {port}")
+        assert result["exit_code"] == 0, result
+        listener.settimeout(1)
+        connection, address = listener.accept()
+        connection.close()
+
+
 def test_runner_caps_output_and_time(tmp_path):
     start = time.monotonic()
     result = shell._run_bounded(["/bin/sh"], b"while :; do printf 1234567890; done\n", tmp_path, {}, 2)

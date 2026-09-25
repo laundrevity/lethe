@@ -1,7 +1,7 @@
-"""Opt-in, read-only command execution under macOS Seatbelt.
+"""Opt-in shell execution: read-only Seatbelt or explicit full host access.
 
-There is deliberately no unsandboxed fallback or writable mode. Commands, the
-profile, and output stay in memory; no shell history or temporary scripts.
+There is no automatic unsandboxed fallback. Lethe keeps commands and captured
+output in memory; commands in full mode may write files or send data themselves.
 """
 
 from __future__ import annotations
@@ -14,12 +14,21 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 SANDBOX_EXEC = Path("/usr/bin/sandbox-exec")
 MAX_COMMAND_BYTES = 8_000
 MAX_OUTPUT_BYTES = 16_000
 MAX_TIMEOUT = 30
+FULL_DEFAULT_TIMEOUT = 120
+FULL_MAX_TIMEOUT = 600
+
+
+class ShellMode(str, Enum):
+    READ_ONLY = "read-only"
+    FULL = "full"
+
 
 # Paths are passed as sandbox parameters, never interpolated into Scheme code.
 # No network, Mach services (including clipboard/Apple Events), arbitrary device
@@ -63,14 +72,28 @@ class SandboxUnavailable(RuntimeError):
     pass
 
 
+def _validate_command(command: str, timeout_seconds: int, max_timeout: int) -> None:
+    if not isinstance(command, str) or not command.strip() or "\0" in command:
+        raise ValueError("command must be a nonempty string without NUL bytes")
+    if len(command.encode("utf-8")) > MAX_COMMAND_BYTES:
+        raise ValueError(f"command exceeds {MAX_COMMAND_BYTES:,} bytes")
+    if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= max_timeout:
+        raise ValueError(f"timeout_seconds must be an integer from 1 to {max_timeout}")
+
+
+def _resolve_directory(path: Path) -> Path:
+    root = path.expanduser().resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError("shell directory must be an existing directory")
+    return root
+
+
 @dataclass(frozen=True)
 class ShellSandbox:
     root: Path
 
     def __post_init__(self):
-        root = self.root.expanduser().resolve(strict=True)
-        if not root.is_dir():
-            raise ValueError("shell directory must be an existing directory")
+        root = _resolve_directory(self.root)
         # Avoid accidentally exposing an entire machine or home directory.
         if root == Path.home().resolve() or root in Path.home().resolve().parents:
             raise ValueError("choose a project directory, not your home directory or its parents")
@@ -90,12 +113,7 @@ class ShellSandbox:
     def execute(self, command: str, cwd: str = ".", timeout_seconds: int = 10) -> dict:
         if sys.platform != "darwin" or not SANDBOX_EXEC.is_file():
             raise SandboxUnavailable("shell tools require macOS /usr/bin/sandbox-exec; no unsandboxed fallback")
-        if not isinstance(command, str) or not command.strip() or "\0" in command:
-            raise ValueError("command must be a nonempty string without NUL bytes")
-        if len(command.encode("utf-8")) > MAX_COMMAND_BYTES:
-            raise ValueError(f"command exceeds {MAX_COMMAND_BYTES:,} bytes")
-        if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= MAX_TIMEOUT:
-            raise ValueError(f"timeout_seconds must be an integer from 1 to {MAX_TIMEOUT}")
+        _validate_command(command, timeout_seconds, MAX_TIMEOUT)
         if not isinstance(cwd, str) or "\0" in cwd:
             raise ValueError("cwd must be a directory within the shell workspace")
         workdir = (self.root / cwd).resolve(strict=True)
@@ -125,6 +143,39 @@ class ShellSandbox:
         return _run_bounded(argv, script, workdir, env, timeout_seconds)
 
 
+@dataclass(frozen=True)
+class FullShell:
+    """Run as the current user, without Lethe's filesystem or network sandbox."""
+
+    root: Path
+
+    def __post_init__(self):
+        object.__setattr__(self, "root", _resolve_directory(self.root))
+
+    def check_available(self) -> None:
+        result = self.execute("printf lethe-shell-ok", timeout_seconds=5)
+        if result["exit_code"] != 0 or result["stdout"] != "lethe-shell-ok":
+            detail = result["stderr"].strip() or f"exit {result['exit_code']}"
+            raise RuntimeError(f"full-access shell could not start ({detail}); shell tool disabled")
+
+    def run(self, command: str, cwd: str = ".", timeout_seconds: int = FULL_DEFAULT_TIMEOUT) -> str:
+        return json.dumps(self.execute(command, cwd, timeout_seconds), ensure_ascii=False)
+
+    def execute(self, command: str, cwd: str = ".", timeout_seconds: int = FULL_DEFAULT_TIMEOUT) -> dict:
+        _validate_command(command, timeout_seconds, FULL_MAX_TIMEOUT)
+        if not isinstance(cwd, str) or "\0" in cwd:
+            raise ValueError("cwd must be an existing directory")
+        workdir = _resolve_directory(self.root / Path(cwd).expanduser())
+        # Keep PATH, HOME, credentials, proxies, and tool configuration from the
+        # launching environment. No shell history, temporary script, or ulimit
+        # preamble: builds and installs need normal file and resource access.
+        env = {**os.environ, "HISTFILE": "/dev/null"}
+        return _run_bounded(
+            ["/bin/sh", "-s"], (command + "\n").encode("utf-8"), workdir, env, timeout_seconds,
+            stop_on_output_limit=False,
+        )
+
+
 def _kill_group(proc: subprocess.Popen) -> None:
     try:
         os.killpg(proc.pid, signal.SIGKILL)
@@ -132,11 +183,14 @@ def _kill_group(proc: subprocess.Popen) -> None:
         pass
 
 
-def _run_bounded(argv: list[str], script: bytes, cwd: Path, env: dict, timeout: int) -> dict:
+def _run_bounded(
+    argv: list[str], script: bytes, cwd: Path, env: dict, timeout: int, *, stop_on_output_limit: bool = True,
+) -> dict:
     """Drain both pipes without unbounded communicate() buffers, even on a flood.
 
-    A new process group lets timeout, output overflow, and Ctrl-C also stop normal
-    child processes. Detached processes are unsupported (see README).
+    A new process group lets timeout, optional output overflow, and Ctrl-C also
+    stop normal child processes. Full mode drains excess output so verbose builds
+    can finish. Detached processes are unsupported (see README).
     """
     started = time.monotonic()
     output = {"stdout": bytearray(), "stderr": bytearray()}
@@ -176,10 +230,11 @@ def _run_bounded(argv: list[str], script: bytes, cwd: Path, env: dict, timeout: 
                         total += min(room, len(chunk))
                         if len(chunk) > room:
                             truncated = True
-                            break
-                    if truncated:
+                            if stop_on_output_limit:
+                                break
+                    if truncated and stop_on_output_limit:
                         break
-                if not timed_out and not truncated:
+                if not timed_out and not (truncated and stop_on_output_limit):
                     try:
                         proc.wait(timeout=max(0.001, timeout - (time.monotonic() - started)))
                     except subprocess.TimeoutExpired:

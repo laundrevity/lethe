@@ -38,7 +38,7 @@ So the defaults are:
 | pid / state files | none | running servers are found via the process table |
 | network | `127.0.0.1` only | |
 | `chat` REPL | writes nothing; no history file (Up-arrow recall is in-memory only) | `/wipe` clears the conversation **and** the terminal scrollback |
-| shell tool | **off**; `chat --tools [--shell-dir PATH]` opts in | macOS sandbox: read-only workspace + system runtime, no network, confirmation for every command; command text and captured output stay in memory unless you save the conversation |
+| shell tool | **off**; `chat --tools [--shell-dir PATH]` opts in | read-only/offline macOS sandbox by default; `--shell-mode full` allows writes, network, and your inherited environment. Both modes confirm every command; Lethe keeps command text and captured output in memory unless you save the conversation |
 | saved conversations | **off**; `chat --save` / `/save` opt in **per conversation** | AES-256-GCM, key from your passphrase via scrypt, passphrase never stored; random filenames, title/model inside the ciphertext; `lethe conversations` lists ids only (`--unlock` to see titles), `--delete` overwrites then removes |
 | clipboard | only on explicit `/copy` | clipboard managers and Universal Clipboard can persist or forward that, so it's never automatic |
 | Hugging Face | telemetry disabled; downloads anonymous unless the repo is gated | what you download is still visible to HF, as with any download |
@@ -56,7 +56,7 @@ conversation is local-only and unobserved, and that post-cutoff reality is real 
 part, models tend to read genuine post-cutoff news as fiction or an evaluation scenario. `--system TEXT`
 replaces it; `--no-system` sends none.
 
-**Internet tools are the one opt-in exception to "nothing leaves the machine".** `chat --tools web,fetch`
+**Internet tools and full-access shell mode are opt-in exceptions to "nothing leaves the machine".** `chat --tools web,fetch`
 gives the model `web_search` (keyless ddgs metasearch over Google/Brave/Bing/Mojeek/…, or your own
 SearXNG via `--searx URL`) and `fetch_url` (page → markdown via trafilatura); `/web` in the REPL turns
 them on mid-conversation and `/web off` withdraws them (the default system prompt is patched to match). The model composes the
@@ -65,22 +65,59 @@ is printed before it is sent; `--tools-confirm` additionally asks y/n per reques
 (~4K tokens; the model pages through long articles with an offset), never cached or written to disk,
 and every URL and redirect hop is checked for private/LAN addresses, with the connection pinned to the
 address that was checked (no DNS rebinding). The default system prompt stops claiming
-network silence when internet tools are on.
+network silence when internet tools or full-access shell mode are on. Full-access commands can also
+write files or logs; Lethe's in-memory conversation handling does not prevent those command side effects.
 
-## Sandboxed command-line tool
+## Command-line tool
 
 ```bash
 uv run lethe --tools                         # shell tool, reading the current directory
 uv run lethe --tools --shell-dir ./src       # let the model inspect this directory instead
 uv run lethe --web --tools                   # internet tools + shell
+uv run lethe --web --tools --shell-mode full  # internet tools + full-access shell
 uv run lethe --tools web,fetch,shell         # or name tools explicitly (--shell is the same as bare --tools)
 ```
 
-The model gets `run_shell(command, cwd=".", timeout_seconds=10)`. It can use macOS commands such as
-`ls`, `find`, `grep`, `sed`, `awk`, and pipelines to explore files and compute answers. Before every
-execution, Lethe shows the workspace and **entire command**, then asks for confirmation (default: no).
+The model gets `run_shell(command, cwd=".", timeout_seconds=...)`. Before every execution, Lethe
+shows the mode, workspace or starting directory, and **entire command**, then asks for confirmation (default: no).
 `--yes` only affects model downloads; shell approval is always required. `/shell` shows the scope;
 `/shell off` removes the tool. `/web off` only removes internet tools.
+
+Any chat can enable tools later, including chats started with no tool flags. Enter these commands
+at the `you ›` prompt; the conversation continues with the new tools on the next message:
+
+| Chat command | Effect |
+|---|---|
+| `/web` | Enable web search and page fetching |
+| `/shell full` | Enable or upgrade to full shell access |
+| `/tools full` | Enable both web tools and full shell access |
+| `/tools full "~/dev/my project"` | Enable both, starting the shell in the selected directory |
+| `/shell read-only` | Switch to the read-only shell; preserve web tools |
+| `/shell off` | Disable the shell; preserve web tools |
+| `/tools off` | Disable all tools |
+
+`/tools` shows current access. `/shell full` and `/shell read-only` also accept an optional directory;
+otherwise they reuse the launch directory or the last directory you selected, even after switching
+tools off. The built-in model instructions explain that the model may ask you to enable these tools
+when needed. Typing the command grants access; shell executions still ask for approval individually.
+Tool descriptions and the built-in system prompt update immediately. A failed mode change leaves
+the existing tools and directory unchanged.
+
+`--shell-mode read-only` is the default. `--shell-mode full` selects a separate runner without
+Lethe's sandbox, running as your current user. Full mode enables file edits, builds, installs, and
+network access (including localhost) using your inherited PATH, environment, credentials, proxies,
+and tool configuration. It works with Homebrew tools and virtual environments on that PATH.
+`--shell-dir` sets the starting directory in full mode; commands can access other directories with
+your account's normal permissions. `cwd` accepts relative paths, absolute paths, and `~`.
+Each call starts a fresh noninteractive `/bin/sh`; shell aliases and functions from an interactive
+shell are not loaded. Both modes still require confirmation for every command.
+
+For example, `uv run lethe --tools --shell-mode full --shell-dir ~/dev/my-project` enables full
+shell access starting in that project. Add `--web` for the dedicated search/fetch tools; shell
+networking in full mode works independently of `--web`. At launch, `--shell-mode` requires
+`--tools` or `--shell`. In chat, use `/shell full`, `/shell read-only`, or `/tools full` to change
+access without restarting. The model can ask for access; you grant it with a chat command.
+A sandbox failure never switches modes automatically.
 
 Ask for an action when you want an actual command, for example:
 
@@ -94,36 +131,43 @@ enabled, the model may reason before requesting the tool; Ctrl-C cancels that tu
 or launch with `--no-thinking` to disable reasoning. `--no-show-thinking` only hides its display.
 Bare `--tools` (or `--tool`, or `--shell`) enables the shell; `--web --tools` gives internet + shell.
 
-This first version is **read-only**: even writes inside the selected directory are denied, including
+In **read-only mode**, even writes inside the selected directory are denied, including
 temporary files, installs, edits, deletes, and caches. The directory defaults to the current working
 directory; home and its parent directories are refused. Select the smallest useful directory: all
 files inside it, including `.env` or other secrets, are readable. Symlinks do not grant access to files
 outside the allowed paths. OS utilities, libraries, and limited system metadata are also readable.
 Homebrew programs, virtual environments whose interpreters live outside the workspace, and build tools
-that require scratch files may not work in this initial mode.
+that require scratch files may not work in this mode.
 
-Each call starts a fresh noninteractive `/bin/sh` with a fixed `/usr/bin:/bin` PATH, no inherited
+Read-only commands use a fixed `/usr/bin:/bin` PATH, no inherited
 credentials/proxies/SSH agent, and no automatic shell startup files. The OS denies network access
 (including localhost and Unix sockets), writes, and access to other host processes. Commands receive
 a 10-second default wall-clock limit (maximum 30), hard CPU/file-size/file-descriptor limits, and a
-16,000-byte combined output cap. Results include `stdout`, `stderr`, `exit_code`, `timed_out`, and
-`truncated`; hitting the output cap stops the command. Normal child processes are killed with the
-command on timeout, overflow, or Ctrl-C. There are at most 8 tool rounds and 16 calls per user turn.
+16,000-byte combined output cap; hitting that cap stops the command in read-only mode.
+Full mode defaults to a 120-second wall-clock limit (maximum 600) and uses normal resource limits.
+It captures up to the same output cap, discarding excess output while the command continues until
+exit or timeout, so verbose builds can finish. Results include `stdout`, `stderr`, `exit_code`,
+`timed_out`, and `truncated`. Both modes clean up normal child processes when a call finishes,
+times out, or is interrupted with Ctrl-C. There are at most 8 tool rounds and 16 calls per user turn.
 
-Enforcement uses macOS `/usr/bin/sandbox-exec` (Seatbelt), with a real startup probe. Unsupported
-platforms or sandbox setup errors disable the shell tool; there is no unsandboxed fallback. Apple
+Read-only enforcement uses macOS `/usr/bin/sandbox-exec` (Seatbelt), with a real startup probe. Unsupported
+platforms or sandbox setup errors disable read-only mode; there is no automatic unsandboxed fallback. Apple
 marks this interface deprecated, and it may stop working on a future macOS release. This is a
 filesystem/network boundary, **not a VM or a complete resource-isolation system**: memory and aggregate
 process count are not capped, and deliberately detached processes can escape process-group cleanup
 (they still inherit the sandbox). Background daemons and hostile-code analysis are unsupported.
 macOS itself may retain diagnostics; Lethe does not write command scripts, history, profiles, or output
-files. Enabling `--web` separately still allows the model to send queries/URLs to the internet, so shell
-read access and internet tools together can expose information from files in the chosen workspace.
+files, but commands in full mode can write files and logs themselves. Enabling `--web` separately
+still allows the model to send queries/URLs to the internet, so shell read access and internet tools
+together can expose information from files in the chosen workspace.
 
 Run the ordinary tests with `uv run pytest`. To verify the actual OS restrictions on macOS, run
 `uv run pytest tests/test_shell.py --run-sandbox` from a normal terminal; nested sandboxes may prevent
 the startup probe. These tests check allowed reads/pipelines and denied writes, outside reads,
-symlink escapes, loopback/Unix sockets, host-process access, timeouts, and output flooding.
+symlink escapes, loopback/Unix sockets, host-process access, timeouts, and output flooding, plus
+allowed localhost connections in full mode. Ordinary tests also exercise full-mode writes,
+environment/PATH inheritance, confirmation, CLI selection, and enabling/changing tools mid-chat
+without losing history. They also check failed mode changes preserve the previous access.
 
 To check the model → shell → model path against an already-running server on port 8080, run
 `uv run pytest -q -s tests/test_live_tools.py --run-live-tools`. This opt-in test uses the normal
@@ -160,7 +204,7 @@ from the GGUF's architecture, following each model card's recommendations; overr
 | `lethe models` | the same table for what's on disk, plus what other model processes are holding right now |
 | `lethe default [spec]` | show / set the default model |
 | `lethe serve [spec] [--ctx N] [--kv q8_0] [--no-mtp] [--no-thinking] [--effort xhigh] [--vision]` | launch `llama-server` with the memory plan printed against what is *free now*; defaults to the native max context if it fits |
-| `lethe [chat] [spec] [-f FILE …] [--save] [--resume ID] [--web] [--tools [--shell-dir PATH]] [--system TEXT] [--no-system]` (the command word is optional) | streaming REPL; after every turn: prompt tok/s, gen tok/s, MTP acceptance, context used/total (colored; warns at 80%) |
+| `lethe [chat] [spec] [-f FILE …] [--save] [--resume ID] [--web] [--tools [--shell-mode full] [--shell-dir PATH]] [--system TEXT] [--no-system]` (the command word is optional) | streaming REPL; after every turn: prompt tok/s, gen tok/s, MTP acceptance, context used/total (colored; warns at 80%) |
 | `lethe conversations [--unlock] [--delete ID]` | encrypted saved conversations |
 | `lethe bench [spec] [-d 0,32768]` | `llama-bench` prompt/gen speeds at context depth — **no speculative decoding, this is the floor** |
 | `lethe bench [spec] --server [-d 0,32768]` | through `llama-server`: no-MTP vs embedded MTP vs FastMTP, real tok/s and acceptance |

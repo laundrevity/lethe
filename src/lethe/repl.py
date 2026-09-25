@@ -1,8 +1,9 @@
-"""The interactive chat loop. Writes nothing to disk unless the user turns on --save."""
+"""The interactive chat loop. Conversation storage is opt-in; full shell commands may write files."""
 
 from __future__ import annotations
 
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -46,7 +47,8 @@ HELP = """\
 /save          start saving this conversation, encrypted, to .lethe/conversations/ (asks for a passphrase)
 /stats         last turn's throughput/context line
 /web [off]     enable internet tools mid-chat (search + page fetch; every request is printed) — or launch with --web
-/shell [off]   show shell status or disable it (enable at launch with --tools [--shell-dir PATH])
+/shell [full|read-only|off] [PATH]  show, enable, change, or disable shell access mid-chat
+/tools [full|off] [PATH]  show tools, enable web + full shell access, or disable all tools
 Enter sends · Ctrl+Enter / Ctrl+J / \\+Enter add a line · paste multi-line freely · Ctrl-C interrupts a reply"""
 
 
@@ -70,6 +72,7 @@ class ReplConfig:
     tools: dict = field(default_factory=dict)  # name -> tools.Tool; empty = no model tools
     tools_confirm: bool = False
     searx: str | None = None  # so /web can build the registry mid-session with the launch-time backend
+    shell_dir: Path = field(default_factory=Path.cwd)  # remembered across mode changes and /shell off
 
 
 def _make_reader():
@@ -164,6 +167,60 @@ def _sync_tool_prompt(messages: list[dict], cfg: ReplConfig) -> None:
             message["content"] = T.sync_system_text(message["content"], cfg.tools)
 
 
+def _enable_shell(cfg: ReplConfig, mode: T.ShellMode, directory: Path | None = None, *, web: bool = False) -> None:
+    """Build and probe the replacement before changing any active tools."""
+    root = (directory if directory is not None else cfg.shell_dir).expanduser().resolve()
+    registry = T.build_registry(
+        ["shell", "web"] if web else ["shell"], searx=cfg.searx, shell_dir=root, shell_mode=mode,
+    )
+    cfg.tools.update(registry)
+    cfg.shell_dir = root
+
+
+def _tool_command(cmd: str, arg: str, messages: list[dict], cfg: ReplConfig) -> None:
+    usage = (
+        "usage: /shell [full|read-only|off] [PATH]"
+        if cmd == "shell" else "usage: /tools [full|off] [PATH]"
+    )
+    try:
+        parts = shlex.split(arg)
+        if not parts:
+            if cmd == "tools":
+                con.print("tools: " + (", ".join(cfg.tools) or "off"), markup=False)
+            if "run_shell" in cfg.tools:
+                con.print(cfg.tools["run_shell"].description, markup=False, highlight=False)
+            else:
+                con.print("shell tool off — /shell read-only, /shell full, or /tools full to enable", style="dim")
+            return
+        if parts == ["off"]:
+            if cmd == "tools":
+                cfg.tools.clear()
+            else:
+                cfg.tools.pop("run_shell", None)
+            _sync_tool_prompt(messages, cfg)
+            con.print("all tools off" if cmd == "tools" else "shell tool off", style="dim")
+            return
+        modes = {"full": T.ShellMode.FULL}
+        if cmd == "shell":
+            modes["read-only"] = T.ShellMode.READ_ONLY
+        if parts[0] not in modes or len(parts) > 2:
+            con.print(usage + " (quote paths with spaces)", style="yellow", markup=False)
+            return
+        directory = Path(parts[1]) if len(parts) == 2 else None
+        _enable_shell(cfg, modes[parts[0]], directory, web=cmd == "tools")
+    except (OSError, ValueError, RuntimeError) as e:
+        con.print("tools unchanged: " + _terminal_safe(str(e)), style="red", markup=False)
+        return
+    except KeyboardInterrupt:
+        con.print("tool change cancelled; tools unchanged", style="dim")
+        return
+    _sync_tool_prompt(messages, cfg)
+    if cmd == "tools":
+        con.print("web tools ON: web_search, fetch_url", style="yellow")
+    con.print(cfg.tools["run_shell"].confirmation_context, style="yellow", markup=False, highlight=False)
+    con.print("confirmation required for every shell command", style="dim")
+
+
 def _invoke_tool(cfg: ReplConfig, name: str, arguments: str) -> str:
     tool = cfg.tools.get(name)
     if tool is None:
@@ -224,7 +281,11 @@ def run(cfg: ReplConfig) -> None:
         + " · /help for commands[/]"
     )
     if "run_shell" in cfg.tools:
-        con.print("shell: read-only, network blocked, confirmation required for every command", style="yellow")
+        scope = (
+            "full access, files writable, network allowed, inherited environment"
+            if cfg.tools["run_shell"].shell_mode == T.ShellMode.FULL else "read-only, network blocked"
+        )
+        con.print(f"shell: {scope}, confirmation required for every command", style="yellow")
     if cfg.resume:
         for m in messages:
             if m["role"] == "user":
@@ -263,7 +324,7 @@ def run(cfg: ReplConfig) -> None:
             if cmd in ("quit", "exit", "q"):
                 break
             elif cmd == "help":
-                con.print(HELP)
+                con.print(HELP, markup=False)
             elif cmd == "reset":
                 messages = [m for m in messages if m["role"] == "system"]
                 last, last_reply = None, ""
@@ -340,20 +401,13 @@ def run(cfg: ReplConfig) -> None:
                 if arg == "off":
                     for name in T.WEB_TOOL_NAMES:
                         cfg.tools.pop(name, None)
-                    con.print("[dim]internet tools off[/]")
+                    con.print("[dim]web search/fetch tools off[/]")
                 else:
                     cfg.tools.update(T.build_registry(["web"], searx=cfg.searx))
                     con.print("[yellow]internet tools ON: web_search, fetch_url — model-composed queries/URLs will leave this machine; every request is printed[/]")
                 _sync_tool_prompt(messages, cfg)
-            elif cmd == "shell":
-                if arg == "off":
-                    cfg.tools.pop("run_shell", None)
-                    _sync_tool_prompt(messages, cfg)
-                    con.print("[dim]shell tool off[/]")
-                elif "run_shell" in cfg.tools:
-                    con.print(cfg.tools["run_shell"].description, markup=False)
-                else:
-                    con.print("[dim]shell tool off — enable at launch with --tools [--shell-dir PATH][/]")
+            elif cmd in ("shell", "tools"):
+                _tool_command(cmd, arg, messages, cfg)
             else:
                 con.print("[dim]unknown command — /help[/]")
             continue
