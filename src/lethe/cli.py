@@ -143,7 +143,7 @@ def _pull(repo: str, g: hub.HubGguf, ggufs: list[hub.HubGguf], sidecars: bool = 
             if s.rfilename.endswith((".patch", "SHA256SUMS", "MANIFEST.json")):
                 want.append(s.rfilename)
     want = list(dict.fromkeys(want))
-    total = sum(x.size for x in ggufs for f in x.files if f in want)
+    total = sum(x.size for x in ggufs if any(f in want for f in x.files))  # x.size covers all shards of x
     con.print(f"downloading {len(want)} files (~{fmt_bytes(total)}) → {hub.local_dir_for(repo)}")
     for f in want:
         con.print(f"  {f}")

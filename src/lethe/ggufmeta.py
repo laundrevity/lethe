@@ -182,6 +182,42 @@ def _get(kv: dict, key: str, default=None):
     return v
 
 
+# Sliding-window layer periods llama.cpp hard-codes when the GGUF carries no `sliding_window_pattern`
+# (mirrors hparams.set_swa_pattern(period, dense_first) in vendor/llama.cpp/src/models/*.cpp).
+# period p, dense_first=False: layers with (i+1) % p == 0 are full attention (e.g. gpt-oss: odd layers).
+# dense_first=True: layers with i % p == 0 are full. p=0: every layer windowed; p=1: none.
+SWA_PATTERN_DEFAULTS: dict[str, tuple[int, bool]] = {
+    "gpt-oss": (2, False),
+    "gemma2": (2, False),
+    "gemma3": (6, False),
+    "gemma3n": (5, False),
+    "gemma-embedding": (6, False),
+    "cohere2": (4, False),
+    "llama4": (4, False),
+    "olmo2": (4, False),
+    "exaone4": (4, False),
+    "exaone-moe": (4, False),
+    "afmoe": (4, False),
+    "mellum": (4, False),
+    "muse-glimmer": (4, False),
+    "plamo3": (8, False),
+    "modern-bert": (3, True),
+    "smallthinker": (4, True),
+    "laguna": (4, True),
+    "deepseek4": (0, False),
+    "dflash": (0, False),
+    "phi3": (1, False),
+}
+
+
+def _swa_period_layers(n_layer: int, period: int, dense_first: bool = False) -> list[bool]:
+    if period == 0:
+        return [True] * n_layer
+    if dense_first:
+        return [(i % period) != 0 for i in range(n_layer)]
+    return [((i + 1) % period) != 0 for i in range(n_layer)]
+
+
 def shape_from_kv(kv: dict[str, Any], filename: str = "") -> ModelShape:
     arch = kv.get("general.architecture", "unknown")
     a = lambda k, d=None: _get(kv, f"{arch}.{k}", d)  # noqa: E731
@@ -209,9 +245,12 @@ def shape_from_kv(kv: dict[str, Any], filename: str = "") -> ModelShape:
         if isinstance(pattern, list):
             is_swa = [bool(x) for x in pattern] + [False] * (n_layer - len(pattern))
         else:
-            is_swa = [((i + 1) % int(pattern)) != 0 for i in range(n_layer)]
+            is_swa = _swa_period_layers(n_layer, int(pattern))
+    elif swa_window and arch in SWA_PATTERN_DEFAULTS:
+        # llama.cpp hard-codes the period for these archs (src/models/<arch>.cpp); the GGUF has no pattern key
+        is_swa = _swa_period_layers(n_layer, *SWA_PATTERN_DEFAULTS[arch])
     elif swa_window:
-        is_swa = [True] * n_layer  # window everywhere (no pattern key): nothing grows past the window
+        is_swa = [True] * n_layer  # window everywhere (unknown arch, no pattern key): nothing grows past the window
     else:
         is_swa = [False] * n_layer
 

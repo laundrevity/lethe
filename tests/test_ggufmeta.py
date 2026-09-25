@@ -114,3 +114,21 @@ def test_not_gguf():
 )
 def test_quant_from_filename(name, quant):
     assert quant_from_filename(name) == quant
+
+
+def test_swa_default_pattern_gpt_oss(tmp_path):
+    """gpt-oss GGUFs carry sliding_window=128 but no pattern key; llama.cpp alternates window/full (period 2)."""
+    path = write_gguf(
+        tmp_path / "gpt-oss-120b-F16.gguf",
+        "gpt-oss",
+        **{"general.name": "Gpt-Oss-120B", "general.file_type": 1},
+        context_length=131072,
+        block_count=36,
+        embedding_length=2880,
+        **{"attention.head_count": 64, "attention.head_count_kv": 8, "attention.key_length": 64, "attention.value_length": 64},
+        **{"attention.sliding_window": 128},
+    )
+    s = shape_from_kv(parse_local(path), path.name)
+    assert s.n_swa_layers == 18 and s.n_attn_layers == 18
+    assert s.kv_bytes_per_token() == 18 * 8 * (64 + 64) * 2  # 36 KiB
+    assert s.kv_bytes(131072) == s.kv_bytes_per_token() * 131072 + 18 * 8 * 128 * 128 * 2
