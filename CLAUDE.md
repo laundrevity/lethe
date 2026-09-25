@@ -23,8 +23,11 @@ model's inputs and outputs. Every feature must preserve that:
 - Model tools (`tools.py`, `shell.py`) are opt-in per invocation (`--web`/`--tools`/`--shell`, `/web`). Web tools are
   the one way anything leaves the machine: every request is printed first, nothing is cached, fetches are guarded
   against private addresses and pinned with `curl --resolve`. The shell is read-only, offline Seatbelt
-  (`sandbox-exec`), always asks y/n, and has no unsandboxed fallback — never add one. The default system prompt's
-  "nothing leaves this machine" claim is patched by `tools.sync_system_text` to match what is enabled.
+  (`sandbox-exec`), always asks y/n, and has no unsandboxed fallback — never add one. The only unsandboxed shell is the
+  explicit opt-in `--shell-mode full` / `/shell full` / `/tools full` (a separate `FullShell` runner that runs as the
+  user, with writes, network and inherited environment; still confirms every command; a sandbox failure never
+  switches to it). The default system prompt's "nothing leaves this machine" claim is patched by
+  `tools.sync_system_text` to match what is enabled.
 - Running servers are discovered from the process table (`server.running_servers()`), filtered to our
   own binary path — the user runs other llama-servers on this machine (e.g. port 8090); never touch them.
 - Hugging Face: `HF_HUB_DISABLE_TELEMETRY=1` (set in `hub.py` before import); downloads are anonymous
