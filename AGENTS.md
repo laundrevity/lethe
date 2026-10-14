@@ -8,28 +8,45 @@ Target machine: M5 Max, 128 GB unified memory, 40 GPU cores, macOS 26. See READM
 The reason this project exists (vs. Claude/ChatGPT/Codex) is that nobody but the user ever sees the
 model's inputs and outputs. Every feature must preserve that:
 
-- Conversation content never touches disk. No server log (`--log-disable`, stdout → /dev/null), no
-  `--slot-save-path`, no pid/state files, no REPL history. `serve --log` is the only opt-in, and
-  `lethe traces --delete` cleans it up. Never add a "save chat" default; if you add persistence, it
-  must be explicit opt-in per invocation and be listed by `lethe traces`.
+- Conversation content never touches disk. No server log (`--log-disable`, output → /dev/null;
+  `chat --debug-server` shows it on the terminal instead), no `--slot-save-path`, no pid/state files,
+  no REPL history. Never add a "save chat" default; if you add persistence, it must be explicit
+  opt-in per invocation and be listed by `lethe traces`.
 - llama-server always runs with `--no-webui --no-slots`, bound to 127.0.0.1, no `--metrics`, and a
   per-launch random `--api-key` (recovered from the process table by `chat`/`key`; it stops other local
   software and browser pages from using the model — a same-user process could read it from `ps`, that's
   accepted).
 - Saved conversations (`vault.py`) are the ONE content-persistence feature: opt-in per invocation
-  (`chat --save`, `/save`, `--resume`), AES-256-GCM with a scrypt-derived key, passphrase held in memory
+  (`chat --save`, `/save`; `--resume` only reads — nothing is written unless `--save` is given too or `/save`
+  is typed, which continue the same id with the same passphrase), AES-256-GCM with a scrypt-derived key, passphrase held in memory
   only, random filenames, all metadata inside the ciphertext, plaintext never written (not even a temp
   file), delete = overwrite then unlink. `lethe.toml` holds configuration only (default model).
-- Model tools (`tools.py`, `shell.py`) are opt-in per invocation (`--web`/`--tools`/`--shell`, `/web`). Web tools are
+- Model tools (`tools.py`, `shell.py`, `files.py`) are opt-in per invocation (`--web`/`--tools`/`--shell`, `/web`). Web tools are
   the one way anything leaves the machine: every request is printed first, nothing is cached, fetches are guarded
   against private addresses and pinned with `curl --resolve`. The shell is read-only, offline Seatbelt
   (`sandbox-exec`), always asks y/n, and has no unsandboxed fallback — never add one. The only unsandboxed shell is the
   explicit opt-in `--shell-mode full` / `/shell full` / `/tools full` (a separate `FullShell` runner that runs as the
   user, with writes, network and inherited environment; still confirms every command; a sandbox failure never
-  switches to it). The default system prompt's "nothing leaves this machine" claim is patched by
+  switches to it). The shell brings file tools with it (`files.py`): `read_file` in both modes (workspace-confined
+  when read-only), `write_file`/`edit_file` (exact-string replace) in full mode only — never in read-only. They always
+  ask y/n, writes are approved as a diff, and they keep no backups/temp files. The prompt (`repl.ask_approval`) also
+  takes `p`: the call is NOT run and the user's note goes back to the model as the tool result — never execute on `p`.
+  The only way past the y/n prompts is
+  the per-invocation opt-in `--auto-approve files|all` (calls and diffs are still printed; never make it a default or
+  a `lethe.toml` setting). The default system prompt's "nothing leaves this machine" claim is patched by
   `tools.sync_system_text` to match what is enabled.
-- Running servers are discovered from the process table (`server.running_servers()`), filtered to our
-  own binary path — the user runs other llama-servers on this machine (e.g. port 8090); never touch them.
+- **Terminal presentation lives in `terminal.py`.** `StatusLine` pins one line to the bottom row during a turn
+  (DECSTBM scroll region; Apple Terminal keeps the scrollback for a top-anchored region but drops the pending-wrap
+  flag across cursor save/restore — hence the column tracking and no redraw at the right margin). `notify()` is the
+  bell plus OSC 9/99; its text must stay content-free (Notification Center retains it). The kitty keyboard protocol
+  is pushed only while prompt_toolkit reads a line: left on, Ctrl-C during streaming is no longer SIGINT. Apple
+  Terminal cannot report Shift+Enter at all; don't promise it there.
+- **No background model server, ever.** `lethe` is to a local model what claude code is to Claude: the
+  model is loaded when a run starts and unloaded when it ends. `server.Session` starts `llama-server` on a
+  free loopback port and kills it on exit (`with` block, atexit, SIGTERM/SIGHUP handlers; only SIGKILL of
+  lethe can leave one behind). There is no `serve`/`stop`/`key` command, no process-table discovery and no
+  fixed port; a second `lethe` is simply a second server. The user runs other llama-servers on this machine
+  by hand (e.g. port 8090); never touch them.
 - Hugging Face: `HF_HUB_DISABLE_TELEMETRY=1` (set in `hub.py` before import); downloads are anonymous
   unless the repo is gated (then falls back to `HF_TOKEN`).
 - Before adding any dependency or feature, ask: does it write, phone home, or cache content? If yes,
@@ -61,6 +78,16 @@ model's inputs and outputs. Every feature must preserve that:
 - **`scripts/bump-llama.sh`** moves the submodule to upstream master: it re-applies the FastMTP patch on a
   fresh `lethe-fastmtp` branch, stages the *upstream* commit as the superproject pin (not the patch
   commit), rebuilds and runs `doctor`. Update the pin note below when you use it.
+- **`LETHE.md` is the user-facing instruction file for the *local model*** (`instructions.py`), not for coding agents
+  working on this repo (that is this file). Global layer = `LETHE.md` at the repo root; project layer = nearest
+  `LETHE.md`/`AGENTS.md` from the launch directory up to the repository root. The block is appended after everything
+  else in the system prompt behind `instructions.MARKER`; `tools.sync_system_text` must keep leaving it untouched.
+  Read-only: never write or cache these files.
+- **Ctrl-C keeps the turn as far as it got** (`repl.run`): the reasoning and text streamed so far become
+  an assistant message (`reasoning_content` included), finished tool rounds stay, tool calls that were cut off
+  get a reply saying so, and the next prompt is prefixed with `INTERRUPT_NOTE`. Thinking loops are the default
+  model's main failure mode; interrupting one must not throw the conversation away. A failed turn (server
+  error) is still discarded.
 - **Throughput and context are first-class.** Every chat turn prints prompt tok/s, gen tok/s, MTP
   acceptance, and context used/configured. `browse`/`models` show KV bytes/token and the max context
   that fits. KV math lives in `ggufmeta.py` (own ~100-line GGUF header parser; reads only the first
@@ -82,7 +109,7 @@ model's inputs and outputs. Every feature must preserve that:
 ## First model
 
 `HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF`, quant `Q8_K_P` (31.5 GB), 262K native
-context, embedded MTP head + 900 MB FastMTP draft sidecar (auto-detected by `serve` when it sits next to
+context, embedded MTP head + 900 MB FastMTP draft sidecar (auto-detected when it sits next to
 the model). Measured on this machine: pp2048 690 tok/s, tg 16 tok/s base, 26–47 tok/s with FastMTP,
 RSS ≈ 48.6 GiB at full context. Sampler (thinking): temp 1.0, top_p 0.95, top_k 20, min_p 0.
 Non-thinking: temp 0.7, top_p 0.8, presence_penalty 1.5, `enable_thinking=false`. Vision needs `--vision`

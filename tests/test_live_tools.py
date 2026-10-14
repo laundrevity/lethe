@@ -1,4 +1,4 @@
-"""Opt-in smoke test against the user's already-running model; never launches one.
+"""Opt-in smoke test with the default model, loaded for the test and unloaded after it.
 
 Only a fixed, harmless printf command can execute. Prompts/output stay in memory,
 and the real read-only sandbox is used. Run from outside any outer sandbox:
@@ -9,22 +9,25 @@ import json
 
 import pytest
 
-from lethe import cli, repl, server, spec, tools
+from lethe import cli, config, repl, spec, tools
 from lethe.chat import Delta, TurnStats, stream_chat
 from lethe.profiles import profile_for
 
 
 def test_live_model_shell_roundtrip(request, tmp_path, monkeypatch):
     if not request.config.getoption("--run-live-tools"):
-        pytest.skip("live model test: pass --run-live-tools (requires an existing server on port 8080)")
-    rec = server.running_server(8080)
-    assert rec is not None, "No accessible Lethe model server on port 8080; no server was started"
-    assert not rec["logging"], "Use a server started without --log for this in-memory-only smoke test"
-    model = spec.resolve(rec["model"])
+        pytest.skip("live model test: pass --run-live-tools (loads the default model)")
+    default = config.default_model()
+    assert default, "set a default model first: lethe default owner/repo:QUANT"
+    model = spec.resolve(default)
     shape = cli._shape(model.path)
     profile = profile_for(shape)
     registry = tools.build_registry(["shell"], shell_dir=tmp_path)
-    cfg = repl.ReplConfig(rec["url"], rec["api_key"], 0, model.spec, profile, tools=registry)
+    with cli._start(model, ctx=16384, kv="f16", vision=False, thinking=True, effort=None) as srv:
+        _roundtrip(srv, model, shape, profile, registry, repl.ReplConfig(srv.url, srv.api_key, 0, model.spec, profile, tools=registry), monkeypatch)
+
+
+def _roundtrip(srv, model, shape, profile, registry, cfg, monkeypatch):
     command = "printf lethe-shell-smoke-ok"
     messages = [
         {"role": "system", "content": tools.sync_system_text(cli._default_system(model, shape), registry)},
@@ -53,7 +56,7 @@ def test_live_model_shell_roundtrip(request, tmp_path, monkeypatch):
     assert args["command"] == command, "The smoke test will only approve the fixed printf command"
     assert args.get("cwd", ".") == ".", "The smoke test will only approve its isolated workspace"
     # Exercise the real dispatch/approval path after checking the exact command.
-    monkeypatch.setattr(repl.Confirm, "ask", lambda *a, **kw: True)
+    monkeypatch.setattr(repl, "ask_approval", lambda *a, **kw: True)
     result = repl._invoke_tool(cfg, "run_shell", call["function"]["arguments"])
     payload = json.loads(result)
     assert payload["exit_code"] == 0 and payload["stdout"] == "lethe-shell-smoke-ok"

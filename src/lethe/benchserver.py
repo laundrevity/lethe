@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from rich.console import Console
 from rich.table import Table
 
-from . import server, spec as S
+from . import spec as S
 from .chat import TurnStats, stream_chat, tokenize
 
 con = Console()
@@ -54,33 +54,31 @@ def run_server_bench(lm: S.LocalModel, *, depths: list[int], kv: str, launch) ->
     rows: list[Row] = []
     con.print(f"[bold]server benchmark[/] {lm.spec} · configs: {', '.join(c for c, _ in configs)} · depths {depths} · greedy, thinking off, 256 tokens")
     for name, opts in configs:
-        rec = launch(lm, ctx=ctx, kv=kv, draft_n=3, vision=False, thinking=False, effort=None, port=server.DEFAULT_PORT,
-                     no_mmap=False, log=False, api_key=True, extra=[], **opts)
-        url, key = rec["url"], rec.get("api_key")
-        for d in depths:
-            # prompt processing: one uncached prefill of max(2048, depth) tokens, 1 token out.
-            # It also primes the prefix cache, so the generation prompts below only pay for their own text.
-            pp_prefix = _filler_of_tokens(url, key, max(2048, d))
-            with con.status(f"{name} · depth {d:,} · prefill…"):
-                pp_stats = [ev for ev in stream_chat(url, [{"role": "user", "content": pp_prefix + "\n\nReply with OK."}], n_ctx=ctx, sampling={"temperature": 0.0}, max_tokens=1, chat_template_kwargs={"enable_thinking": False}, api_key=key) if isinstance(ev, TurnStats)]
-            pp = pp_stats[-1].prompt_tps
-            con.print(f"[dim]  {name} · d{d:,} · prefill: {pp_stats[-1].prompt_n:,} tok @ {pp:,.0f} tok/s[/]")
-            prefix = pp_prefix if d > 0 else ""
-            stats: list[TurnStats] = []
-            for pname, ptext in PROMPTS.items():
-                msgs = [{"role": "user", "content": (prefix + "\n\n---\n\nIgnore the text above. " if prefix else "") + ptext}]
-                t0 = time.time()
-                with con.status(f"{name} · depth {d:,} · {pname}…"):
-                    for ev in stream_chat(url, msgs, n_ctx=ctx, sampling={"temperature": 0.0}, max_tokens=256, chat_template_kwargs={"enable_thinking": False}, api_key=key):
-                        if isinstance(ev, TurnStats):
-                            stats.append(ev)
-                con.print(f"[dim]  {name} · d{d:,} · {pname}: {stats[-1].line(markup=False)} · {time.time() - t0:.1f}s[/]")
-            gen_n = sum(s.predicted_n for s in stats)
-            gen_ms = sum(s.predicted_ms for s in stats)
-            dn = sum(s.draft_n for s in stats)
-            da = sum(s.draft_n_accepted for s in stats)
-            rows.append(Row(name, d, pp, gen_n / (gen_ms / 1000) if gen_ms else 0.0, (da / dn) if dn else None, gen_n))
-    server.stop()
+        with launch(lm, ctx=ctx, kv=kv, vision=False, thinking=False, effort=None, **opts) as rec:
+            url, key = rec.url, rec.api_key
+            for d in depths:
+                # prompt processing: one uncached prefill of max(2048, depth) tokens, 1 token out.
+                # It also primes the prefix cache, so the generation prompts below only pay for their own text.
+                pp_prefix = _filler_of_tokens(url, key, max(2048, d))
+                with con.status(f"{name} · depth {d:,} · prefill…"):
+                    pp_stats = [ev for ev in stream_chat(url, [{"role": "user", "content": pp_prefix + "\n\nReply with OK."}], n_ctx=ctx, sampling={"temperature": 0.0}, max_tokens=1, chat_template_kwargs={"enable_thinking": False}, api_key=key) if isinstance(ev, TurnStats)]
+                pp = pp_stats[-1].prompt_tps
+                con.print(f"[dim]  {name} · d{d:,} · prefill: {pp_stats[-1].prompt_n:,} tok @ {pp:,.0f} tok/s[/]")
+                prefix = pp_prefix if d > 0 else ""
+                stats: list[TurnStats] = []
+                for pname, ptext in PROMPTS.items():
+                    msgs = [{"role": "user", "content": (prefix + "\n\n---\n\nIgnore the text above. " if prefix else "") + ptext}]
+                    t0 = time.time()
+                    with con.status(f"{name} · depth {d:,} · {pname}…"):
+                        for ev in stream_chat(url, msgs, n_ctx=ctx, sampling={"temperature": 0.0}, max_tokens=256, chat_template_kwargs={"enable_thinking": False}, api_key=key):
+                            if isinstance(ev, TurnStats):
+                                stats.append(ev)
+                    con.print(f"[dim]  {name} · d{d:,} · {pname}: {stats[-1].line(markup=False)} · {time.time() - t0:.1f}s[/]")
+                gen_n = sum(s.predicted_n for s in stats)
+                gen_ms = sum(s.predicted_ms for s in stats)
+                dn = sum(s.draft_n for s in stats)
+                da = sum(s.draft_n_accepted for s in stats)
+                rows.append(Row(name, d, pp, gen_n / (gen_ms / 1000) if gen_ms else 0.0, (da / dn) if dn else None, gen_n))
     t = Table(title=f"{lm.spec} — llama-server, {kv} KV", expand=False)
     t.add_column("config")
     t.add_column("depth", justify="right")

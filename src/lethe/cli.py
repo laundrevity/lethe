@@ -5,9 +5,10 @@ from __future__ import annotations
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 import typer
 from rich.console import Console
@@ -101,10 +102,9 @@ def _budget_line(kv: str) -> int:
 
 def _in_use_line() -> None:
     """Tell the user what other model processes are already holding, so 'fits' is honest."""
-    ours = {r["pid"] for r in server.running_servers()}
-    procs = [p for p in llama_processes() if p.pid in ours or p.rss > 256 * 1024 * 1024]
+    procs = [p for p in llama_processes() if p.rss > 256 * 1024 * 1024]
     if procs:
-        bits = [f"pid {p.pid} {fmt_bytes(p.rss)} ({'lethe' if p.pid in ours else Path(p.cmd.split()[0]).parent.parent.parent.name})" for p in procs]
+        bits = [f"pid {p.pid} {fmt_bytes(p.rss)} ({Path(p.cmd.split()[0]).parent.parent.parent.name})" for p in procs]
         con.print(f"[dim]in use now: {', '.join(bits)} · wired total {fmt_bytes(wired_bytes())}[/]")
 
 
@@ -195,16 +195,15 @@ def _plan_ctx(shape: ModelShape, size: int, ctx: int, kv: str, draft_size: int) 
     return ctx
 
 
-def _launch(
-    lm: S.LocalModel, *, ctx: int, kv: str, mtp: bool, draft: bool, draft_n: int, vision: bool, thinking: bool,
-    effort: str | None, port: int, no_mmap: bool, log: bool, api_key: bool, extra: list[str], foreground: bool = False,
-) -> dict:
+@contextmanager
+def _start(
+    lm: S.LocalModel, *, ctx: int, kv: str, vision: bool, thinking: bool, effort: str | None,
+    mtp: bool = True, draft: bool = True, debug: bool = False,
+) -> Iterator[server.Session]:
+    """A server for this run only: `with _start(...) as srv:` kills it on the way out."""
     shape = _shape(lm.path)
     draft_path = _find_sidecar(lm, "draft") if (mtp and draft) else None
     draft_size = draft_path.stat().st_size if draft_path else 0
-    if server.running_servers():
-        con.print("stopping previous server…")
-        server.stop()
     ctx = _plan_ctx(shape, lm.size, ctx, kv, draft_size)
     if mtp and not shape.has_mtp and not draft_path:
         con.print("[yellow]model has no MTP head; disabling speculative decoding[/]")
@@ -213,29 +212,28 @@ def _launch(
     if vision and not mmproj:
         con.print("[yellow]no mmproj next to the model; vision off[/]")
     cfg = server.ServeConfig(
-        model=lm.path, n_ctx=ctx, draft=draft_path, mtp=mtp, draft_n_max=draft_n, mmproj=mmproj, kv_type=kv,
-        thinking=thinking, reasoning_effort=effort, port=port, no_mmap=no_mmap, log=log,
-        api_key=server.new_api_key() if api_key else None, extra=list(extra),
+        model=lm.path, n_ctx=ctx, draft=draft_path, mtp=mtp, mmproj=mmproj, kv_type=kv,
+        thinking=thinking, reasoning_effort=effort, debug=debug, api_key=server.new_api_key(),
     )
     con.print(
         f"speculative: {'FastMTP draft ' + draft_path.name if draft_path else ('embedded MTP' if mtp else 'off')}"
-        + (f" (depth {draft_n})" if mtp else "")
+        + (f" (depth {cfg.draft_n_max})" if mtp else "")
         + f" · thinking {'on' + (' ' + effort if effort else '') if thinking else 'off'}"
         + (" · vision" if mmproj else "")
     )
-    if foreground:
-        con.print("[dim]$ " + " ".join(cfg.argv()) + "[/]")
-        raise typer.Exit(subprocess.call(cfg.argv()))
+    status = con.status("loading model…")
+    status.start()
     t0 = time.time()
-    with con.status("loading model…") as st:
-        rec = server.start(cfg, on_wait=lambda s: st.update(f"loading model… {s:.0f}s"))
-    p = server.props(rec["url"], cfg.api_key)
-    con.print(
-        f"[green]ready[/] in {time.time() - t0:.1f}s at {rec['url']} · n_ctx {p.get('default_generation_settings', {}).get('n_ctx', '?'):,} · "
-        + (f"[yellow]logging to {server.log_path()}[/]" if log else "[dim]traceless: no log, no web UI, no slots endpoint[/]")
-        + (f"\n[dim]api key required for other clients: {cfg.api_key} (also: lethe key)[/]" if cfg.api_key else "\n[yellow]no api key: any local process or web page can use this server[/]")
-    )
-    return rec
+    try:
+        with server.Session(cfg, on_wait=lambda s: status.update(f"loading model… {s:.0f}s")) as session:
+            status.stop()
+            con.print(
+                f"[green]ready[/] in {time.time() - t0:.1f}s · "
+                + ("[yellow]llama-server output on the terminal[/]" if debug else "[dim]traceless: no log, no web UI, no slots endpoint; the model is unloaded when you quit[/]")
+            )
+            yield session
+    finally:
+        status.stop()
 
 
 # ----------------------------------------------------------------------------- commands
@@ -276,15 +274,8 @@ def doctor():
     head = subprocess.run(["git", "-C", str(llama_dir()), "log", "-1", "--format=%h %s"], capture_output=True, text=True).stdout.strip()
     con.print(f"llama.cpp: {head}")
     con.print(f"local models: {len(S.local_models())} in {models_dir()}" + (f" · default {config.default_model()}" if config.default_model() else ""))
-    rec = server.running_server()
-    if rec:
-        con.print(
-            f"[green]server running[/] pid {rec['pid']} at {rec['url']} — {Path(rec['model']).name}"
-            + (" [yellow](logging ON)[/]" if rec["logging"] else " [dim](traceless)[/]")
-            + ("" if rec["api_key"] else " [yellow](no api key)[/]")
-        )
     if server.log_path().exists():
-        con.print(f"[yellow]![/] {server.log_path()} exists (from a --log run) — remove with: lethe traces --delete")
+        con.print(f"[yellow]![/] {server.log_path()} exists (from an old --log run) — remove with: lethe traces --delete")
     else:
         con.print("[green]✓[/] no logs on disk")
     n = len(vault.list_entries())
@@ -420,54 +411,8 @@ def default(model: Optional[str] = typer.Argument(None, help=MODEL_HELP + " — 
 
 
 @app.command()
-def serve(
-    model: Optional[str] = typer.Argument(None, help=MODEL_HELP + " (default: lethe.toml)"),
-    ctx: int = typer.Option(0, "--ctx", "-c", help="Context tokens (0 = native max if it fits)"),
-    kv: str = typer.Option("f16", help="KV cache type: f16|q8_0|q4_0"),
-    mtp: bool = typer.Option(True, help="MTP speculative decoding (embedded head)"),
-    draft: bool = typer.Option(True, help="Use a FastMTP draft sidecar if one sits next to the model"),
-    draft_n: int = typer.Option(3, help="Draft depth (--spec-draft-n-max)"),
-    vision: bool = typer.Option(False, help="Load the mmproj vision projector if present"),
-    thinking: bool = typer.Option(True, help="Thinking/reasoning mode on"),
-    effort: Optional[str] = typer.Option(None, help="Reasoning effort: low|medium|xhigh (Qwen3.8)"),
-    port: int = typer.Option(server.DEFAULT_PORT),
-    api_key: bool = typer.Option(True, help="Require a per-launch random API key (protects the server from other local software)"),
-    no_mmap: bool = typer.Option(False, help="Read the whole model into memory instead of mmap"),
-    foreground: bool = typer.Option(False, "--fg", help="Run in the foreground with llama-server's output on the terminal"),
-    log: bool = typer.Option(False, "--log", help="OPT-IN: keep llama-server's log in .lethe/server.log (off by default: traceless)"),
-    yes: bool = typer.Option(False, "-y", "--yes", help="Download the model without asking if it isn't local"),
-    extra: list[str] = typer.Option([], "--arg", help="Extra llama-server args (repeatable)"),
-):
-    """Launch llama-server for a model with Metal, flash-attn and MTP, and print the memory plan."""
-    model = model or config.default_model()
-    if not model:
-        err.print("[red]no model given and no default set[/] — lethe serve owner/repo:QUANT, or lethe default …")
-        raise typer.Exit(1)
-    lm = _resolve_or_offer(model, yes)
-    _launch(lm, ctx=ctx, kv=kv, mtp=mtp, draft=draft, draft_n=draft_n, vision=vision, thinking=thinking, effort=effort,
-            port=port, no_mmap=no_mmap, log=log, api_key=api_key, extra=extra, foreground=foreground)
-
-
-@app.command()
-def stop():
-    """Stop the running llama-server."""
-    n = server.stop()
-    con.print(f"[green]stopped {n}[/]" if n else "no server running")
-
-
-@app.command()
-def key():
-    """Print the running server's API key (for pointing other OpenAI-compatible clients at it)."""
-    rec = server.running_server()
-    if not rec:
-        err.print("no server running")
-        raise typer.Exit(1)
-    con.print(rec["api_key"] or "[dim](server started without an api key)[/]")
-
-
-@app.command()
 def chat(
-    model: Optional[str] = typer.Argument(None, help=MODEL_HELP + " (default: running server, else lethe.toml)"),
+    model: Optional[str] = typer.Argument(None, help=MODEL_HELP + " (default: lethe.toml)"),
     ctx: int = typer.Option(0, "--ctx", "-c", help="Context tokens (0 = native max if it fits)"),
     kv: str = typer.Option("f16", help="KV cache type: f16|q8_0|q4_0"),
     thinking: bool = typer.Option(True, help="Thinking mode (server-side default + sampler preset)"),
@@ -487,13 +432,16 @@ def chat(
     shell_dir: Optional[Path] = typer.Option(None, "--shell-dir", help="Shell workspace or, in full mode, starting directory (default: current directory); requires --shell or --tools shell"),
     shell_mode: ShellMode = typer.Option(ShellMode.READ_ONLY, "--shell-mode", help="read-only: offline macOS sandbox. full: run as you, with writes, network, inherited PATH/environment and credentials; requires --tools or --shell"),
     searx: Optional[str] = typer.Option(None, "--searx", help="Back web search with this SearXNG instance URL instead of the ddgs metasearch"),
+    no_instructions: bool = typer.Option(False, "--no-instructions", help="Do not load LETHE.md instruction files (global: the lethe repo's LETHE.md; project: nearest LETHE.md or AGENTS.md from the launch directory up)"),
     tools_confirm: bool = typer.Option(False, "--tools-confirm", help="Ask y/n before every tool call (shell commands always ask)"),
-    save: bool = typer.Option(False, "--save", help="OPT-IN: save this conversation encrypted (asks for a passphrase)"),
-    resume: Optional[str] = typer.Option(None, "--resume", help="Resume a saved conversation by id (see lethe conversations)"),
-    port: int = typer.Option(server.DEFAULT_PORT),
+    auto_approve: Optional[str] = typer.Option(None, "--auto-approve", help="OPT-IN: skip the y/n prompt. files = read_file/write_file/edit_file run unasked (shell still asks); all = shell commands too. Calls and diffs are still printed"),
+    save: bool = typer.Option(False, "--save", help="OPT-IN: save this conversation encrypted (asks for a passphrase; with --resume, keeps saving to that id)"),
+    resume: Optional[str] = typer.Option(None, "--resume", help="Continue a saved conversation by id (see lethe conversations). Reads only: new turns are saved only with --save or /save"),
+    effort: Optional[str] = typer.Option(None, "--effort", help="Reasoning effort: low|medium|xhigh (Qwen3.8; the template's default is xhigh)"),
+    debug_server: bool = typer.Option(False, "--debug-server", help="Show llama-server's own output on the terminal (nothing is written to disk)"),
     yes: bool = typer.Option(False, "-y", "--yes", help="Download the model without asking if it isn't local"),
 ):
-    """Interactive chat. Starts the server if needed. Prints throughput + context stats after every turn."""
+    """Interactive chat. Loads the model for this session and unloads it when you quit."""
     for f in file:
         if not f.is_file():
             err.print(f"[red]no such file: {f}[/]")
@@ -508,6 +456,12 @@ def chat(
         raise typer.Exit(1)
     if shell_mode == ShellMode.FULL and "shell" not in tool_names:
         err.print("--shell-mode full requires --tools or --shell", style="red")
+        raise typer.Exit(1)
+    if auto_approve is not None and auto_approve not in T.AUTO_APPROVE_SCOPES:
+        err.print("--auto-approve takes files or all", style="red")
+        raise typer.Exit(1)
+    if auto_approve and tools_confirm:
+        err.print("--auto-approve and --tools-confirm contradict each other", style="red")
         raise typer.Exit(1)
     tool_registry: dict = {}
     if tool_names:
@@ -532,8 +486,7 @@ def chat(
         except (vault.WrongPassphrase, FileNotFoundError, ValueError) as e:
             err.print(f"[red]{e}[/]")
             raise typer.Exit(1)
-        model = model or resumed.model
-        save = True
+        # Resuming only reads. Saving stays opt-in: --save (same id and passphrase) or /save in the chat.
     elif save:
         from .repl import ask_passphrase
 
@@ -541,42 +494,43 @@ def chat(
         if not passphrase:
             raise typer.Exit(1)
 
-    rec = server.running_server(port)
-    lm: S.LocalModel | None = None
-    if model:
-        lm = _resolve_or_offer(model, yes)
-        if not rec or Path(rec["model"]) != lm.path or (vision and "--mmproj" not in rec["argv"]):
-            rec = _launch(lm, ctx=ctx, kv=kv, mtp=True, draft=True, draft_n=3, vision=vision, thinking=thinking, effort=None,
-                          port=port, no_mmap=False, log=False, api_key=True, extra=[])
-    elif not rec:
-        dflt = config.default_model()
-        if not dflt:
-            err.print("[red]no server running, no model given, no default set[/] — lethe owner/repo:QUANT")
-            raise typer.Exit(1)
-        lm = _resolve_or_offer(dflt, yes)
-        rec = _launch(lm, ctx=ctx, kv=kv, mtp=True, draft=True, draft_n=3, vision=vision, thinking=thinking, effort=None,
-                      port=port, no_mmap=False, log=False, api_key=True, extra=[])
-    if lm is None:
-        lm = S.resolve(rec["model"])
-    api_key = rec.get("api_key")
-    p = server.props(rec["url"], api_key)
-    n_ctx = int(p.get("default_generation_settings", {}).get("n_ctx", 0))
-    has_vision = bool((p.get("modalities") or {}).get("vision"))
+    model = model or (resumed.model if resumed else None) or config.default_model()
+    if not model:
+        err.print("[red]no model given and no default set[/] — lethe owner/repo:QUANT, or lethe default …")
+        raise typer.Exit(1)
+    lm = _resolve_or_offer(model, yes)
     overrides = {k: v for k, v in {"temperature": temp, "top_p": top_p, "top_k": top_k, "min_p": min_p}.items() if v is not None}
 
     from .repl import ReplConfig, run
 
-    sh = _shape(lm.path)
-    if system is None and not no_system:
-        system = T.sync_system_text(_default_system(lm, sh), tool_registry)
-    run(ReplConfig(
-        url=rec["url"], api_key=api_key, n_ctx=n_ctx, model_spec=lm.spec, profile=profile_for(sh),
-        thinking=thinking, show_thinking=show_thinking, system=system, max_tokens=max_tokens,
-        sampling_overrides=overrides, attachments=list(file), vision=has_vision,
-        save=save, resume=resumed, passphrase=passphrase,
-        tools=tool_registry, tools_confirm=tools_confirm, searx=searx,
-        shell_dir=(shell_dir if shell_dir is not None else Path.cwd()).expanduser().resolve(),
-    ))
+    with _start(lm, ctx=ctx, kv=kv, vision=vision, thinking=thinking, effort=effort, debug=debug_server) as srv:
+        p = server.props(srv.url, srv.api_key)
+        n_ctx = int(p.get("default_generation_settings", {}).get("n_ctx", 0))
+        has_vision = bool((p.get("modalities") or {}).get("vision"))
+        sh = _shape(lm.path)
+        if system is None and not no_system:
+            system = T.sync_system_text(_default_system(lm, sh), tool_registry)
+        if not no_instructions and not no_system:
+            from . import instructions
+
+            block, loaded = instructions.load(shell_dir if shell_dir is not None else Path.cwd())
+            if system is not None:
+                system = instructions.apply(system, block)
+            if resumed:  # a saved conversation carries the instructions it was started with; use today's
+                for m in resumed.messages:
+                    if m["role"] == "system" and isinstance(m["content"], str):
+                        m["content"] = instructions.apply(m["content"], block)
+            if loaded:
+                err.print("instructions: " + " · ".join(f"{p} ({layer}, ~{n // 4:,} tok)" for layer, p, n in loaded),
+                          style="dim", markup=False, highlight=False)
+        run(ReplConfig(
+            url=srv.url, api_key=srv.api_key, n_ctx=n_ctx, model_spec=lm.spec, profile=profile_for(sh),
+            thinking=thinking, show_thinking=show_thinking, system=system, max_tokens=max_tokens,
+            sampling_overrides=overrides, attachments=list(file), vision=has_vision,
+            save=save, resume=resumed, passphrase=passphrase,
+            tools=tool_registry, tools_confirm=tools_confirm, searx=searx, auto_approve=auto_approve,
+            shell_dir=(shell_dir if shell_dir is not None else Path.cwd()).expanduser().resolve(),
+        ))
 
 
 @app.command()
@@ -638,7 +592,7 @@ def bench(
     if server_mode:
         from .benchserver import run_server_bench
 
-        run_server_bench(lm, depths=depths, kv=kv, launch=_launch)
+        run_server_bench(lm, depths=depths, kv=kv, launch=_start)
         return
     argv = [
         str(llama_bin("llama-bench")), "-m", str(lm.path), "-ngl", "99", "-fa", "1",
@@ -650,21 +604,11 @@ def bench(
 
 
 @app.command()
-def log(lines: int = typer.Option(60, "-n")):
-    """Tail the server log (only exists if you started the server with --log)."""
-    p = server.log_path()
-    if not p.exists():
-        con.print("[dim]no log — logging is off by default. Opt in with[/] lethe serve <model> --log")
-        return
-    con.print("\n".join(p.read_text(errors="replace").splitlines()[-lines:]))
-
-
-@app.command()
 def traces(delete: bool = typer.Option(False, "--delete", help="Delete what is found (saved conversations included!)")):
     """List (and optionally delete) anything lethe may have written to disk beyond model files."""
     found: list[tuple[Path, str]] = []
     if server.log_path().exists():
-        found.append((server.log_path(), "llama-server log (opt-in --log)"))
+        found.append((server.log_path(), "llama-server log from an old --log run"))
     for e in vault.list_entries():
         found.append((e.path, "encrypted saved conversation (opt-in --save)"))
     if config.config_path().exists():

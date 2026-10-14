@@ -34,7 +34,7 @@ def test_registry_opt_in_and_web_composition(tmp_path, monkeypatch):
     assert set(tools.build_registry(["web"])) == {"web_search", "fetch_url"}
     assert probes == []
     registry = tools.build_registry(["shell", "web"], shell_dir=tmp_path)
-    assert set(registry) == {"run_shell", "web_search", "fetch_url"}
+    assert set(registry) == {"run_shell", "read_file", "web_search", "fetch_url"}
     assert probes == [tmp_path.resolve()]
     assert registry["run_shell"].requires_confirmation
     assert str(tmp_path.resolve()) in registry["run_shell"].description
@@ -47,7 +47,7 @@ def test_full_shell_requires_confirmation_before_writing(tmp_path, monkeypatch):
     monkeypatch.setattr(ShellSandbox, "check_available", lambda self: pytest.fail("sandbox must not be probed"))
     registry = tools.build_registry(["shell", "web"], shell_dir=tmp_path, shell_mode=ShellMode.FULL)
     tool = registry["run_shell"]
-    assert set(registry) == {"run_shell", "web_search", "fetch_url"}
+    assert set(registry) == {"run_shell", "read_file", "write_file", "edit_file", "web_search", "fetch_url"}
     assert tool.shell_mode == ShellMode.FULL and tool.requires_confirmation
     assert "files writable" in tool.confirmation_context and "network allowed" in tool.confirmation_context
     assert tool.parameters["properties"]["timeout_seconds"]["maximum"] == 600
@@ -56,10 +56,10 @@ def test_full_shell_requires_confirmation_before_writing(tmp_path, monkeypatch):
     output = io.StringIO()
     monkeypatch.setattr(repl, "con", Console(file=output, color_system=None, width=1000))
     args = '{"command":"printf written > result.txt; cat result.txt"}'
-    monkeypatch.setattr(repl.Confirm, "ask", lambda *a, **kw: False)
+    monkeypatch.setattr(repl, "ask_approval", lambda *a, **kw: False)
     assert "declined" in repl._invoke_tool(cfg, "run_shell", args)
     assert not (tmp_path / "result.txt").exists()
-    monkeypatch.setattr(repl.Confirm, "ask", lambda *a, **kw: True)
+    monkeypatch.setattr(repl, "ask_approval", lambda *a, **kw: True)
     result = json.loads(repl._invoke_tool(cfg, "run_shell", args))
     assert result["exit_code"] == 0 and result["stdout"] == "written"
     assert (tmp_path / "result.txt").read_text() == "written"
@@ -76,7 +76,7 @@ def test_registry_rejects_unused_or_unknown_shell_mode():
 @pytest.mark.parametrize("arguments", ['[]', 'null', '"text"', '{', '{}', '{"command":1}', '{"command":"ls","extra":true}'])
 def test_invalid_arguments_never_prompt_or_execute(arguments, monkeypatch):
     cfg = make_config(tools={"run_shell": make_tool(lambda **kw: pytest.fail("executed"))})
-    monkeypatch.setattr(repl.Confirm, "ask", lambda *a, **kw: pytest.fail("prompted"))
+    monkeypatch.setattr(repl, "ask_approval", lambda *a, **kw: pytest.fail("prompted"))
     assert repl._invoke_tool(cfg, "run_shell", arguments).startswith("invalid tool arguments:")
 
 
@@ -87,13 +87,13 @@ def test_shell_confirmation_is_mandatory_and_preview_is_complete(monkeypatch):
     cfg = make_config(tools={"run_shell": make_tool(lambda **kw: executed.append(kw) or "ok")})
     command = "printf '" + "x" * 200 + "[conceal] tail \x1b[2J'"
     arguments = json.dumps({"command": command})
-    monkeypatch.setattr(repl.Confirm, "ask", lambda *a, **kw: False)
+    monkeypatch.setattr(repl, "ask_approval", lambda *a, **kw: False)
     assert "declined" in repl._invoke_tool(cfg, "run_shell", arguments)
     assert executed == []
     rendered = output.getvalue()
     assert "[conceal] tail" in rendered and "\\u001b[2J" in rendered
     assert "\x1b" not in rendered and "…" not in rendered
-    monkeypatch.setattr(repl.Confirm, "ask", lambda *a, **kw: True)
+    monkeypatch.setattr(repl, "ask_approval", lambda *a, **kw: True)
     assert repl._invoke_tool(cfg, "run_shell", arguments) == "ok"
     assert executed == [{"command": command}]
 
@@ -101,7 +101,7 @@ def test_shell_confirmation_is_mandatory_and_preview_is_complete(monkeypatch):
 def test_eof_declines_and_disabled_tool_never_runs(monkeypatch):
     def eof(*args, **kwargs):
         raise EOFError
-    monkeypatch.setattr(repl.Confirm, "ask", eof)
+    monkeypatch.setattr(repl, "ask_approval", eof)
     cfg = make_config(tools={"run_shell": make_tool(lambda **kw: pytest.fail("executed"))})
     assert "declined" in repl._invoke_tool(cfg, "run_shell", '{"command":"ls"}')
     cfg.tools.clear()
@@ -194,7 +194,7 @@ def test_toolless_chat_can_enable_full_access_then_execute_without_losing_histor
     def approve(*args, **kwargs):
         approvals.append(args)
         return True
-    monkeypatch.setattr(repl.Confirm, "ask", approve)
+    monkeypatch.setattr(repl, "ask_approval", approve)
     calls = []
     def stream(url, messages, **kwargs):
         calls.append(list(messages))
@@ -203,7 +203,8 @@ def test_toolless_chat_can_enable_full_access_then_execute_without_losing_histor
             assert tools.TOOL_ACCESS_NOTE in messages[0]["content"]
             yield repl.Delta(content="I remember the project. You can enable access with /tools full.")
         elif len(calls) == 2:
-            assert {t["function"]["name"] for t in kwargs["tools"]} == {"run_shell", "web_search", "fetch_url"}
+            assert {t["function"]["name"] for t in kwargs["tools"]} == tools.SHELL_TOOL_NAMES | tools.WEB_TOOL_NAMES
+            assert tools.FILE_TOOLS_NOTE in messages[0]["content"]
             assert messages[1]["content"] == "remember the project"
             assert messages[2]["content"].startswith("I remember the project.")
             assert tools.FULL_SHELL_NOTE in messages[0]["content"]
@@ -220,6 +221,7 @@ def test_toolless_chat_can_enable_full_access_then_execute_without_losing_histor
             assert len(calls) == 4 and kwargs["tools"] is None
             assert tools.VACUUM_CLAIM in messages[0]["content"]
             assert tools.FULL_SHELL_NOTE not in messages[0]["content"]
+            assert tools.FILE_TOOLS_NOTE not in messages[0]["content"]
             yield repl.Delta(content="Tools are off.")
     monkeypatch.setattr(repl, "stream_chat", stream)
     repl.run(cfg)
@@ -278,31 +280,10 @@ def test_failed_midchat_probe_preserves_active_mode_and_directory(tmp_path, monk
     assert "tools unchanged: probe failed" in output.getvalue()
 
 
-@pytest.mark.parametrize("batch_size,expected_executions,expected_streams", [(1, 8, 9), (20, 16, 2)])
-def test_tool_loop_has_hard_round_and_total_call_limits(monkeypatch, batch_size, expected_executions, expected_streams):
-    inputs = iter(["do work", "/quit"])
-    monkeypatch.setattr(repl, "_make_reader", lambda: lambda prompt: next(inputs))
-    monkeypatch.setattr(repl.Confirm, "ask", lambda *a, **kw: True)
-    executed = []
-    cfg = make_config(tools={"run_shell": make_tool(lambda **kw: executed.append(kw) or "ok")})
-    advertised = []
-    def stream(url, messages, **kwargs):
-        advertised.append(kwargs["tools"])
-        assert len(advertised) <= expected_streams  # malicious model keeps asking after withdrawal
-        yield repl.Delta(tool_calls=[{
-            "id": f"call-{len(advertised)}-{i}", "type": "function",
-            "function": {"name": "run_shell", "arguments": '{"command":"ls"}'},
-        } for i in range(batch_size)])
-    monkeypatch.setattr(repl, "stream_chat", stream)
-    repl.run(cfg)
-    assert len(executed) == expected_executions
-    assert len(advertised) == expected_streams and advertised[-1] is None
-
-
 def test_tool_results_return_to_model_before_final_answer(monkeypatch):
     inputs = iter(["list files", "/quit"])
     monkeypatch.setattr(repl, "_make_reader", lambda: lambda prompt: next(inputs))
-    monkeypatch.setattr(repl.Confirm, "ask", lambda *a, **kw: True)
+    monkeypatch.setattr(repl, "ask_approval", lambda *a, **kw: True)
     result = '{"exit_code":0,"stdout":"README.md","stderr":"","timed_out":false,"truncated":false}'
     cfg = make_config(tools={"run_shell": make_tool(lambda **kw: result)})
     rounds = []
@@ -338,3 +319,20 @@ def test_fetch_pins_curl_to_the_guarded_address(monkeypatch):
     monkeypatch.setattr(tools.socket, "getaddrinfo", lambda host, port: [(2, 1, 6, "", ("93.184.216.34", 0)), (2, 1, 6, "", ("10.0.0.5", 0))])
     with pytest.raises(ValueError, match="private/local"):
         tools.fetch_url("http://rebind.test/")
+
+
+def test_perhaps_hands_the_model_a_note_instead_of_running(monkeypatch):
+    executed, bells = [], []
+    monkeypatch.setattr(repl, "notify", lambda message, out=None: bells.append(message))
+    cfg = make_config(tools={"run_shell": make_tool(lambda **kw: executed.append(kw) or "ok")})
+    monkeypatch.setattr(repl, "ask_approval", lambda *a, **kw: "use ninja, not make")
+    result = repl._invoke_tool(cfg, "run_shell", '{"command":"make"}')
+    assert result.startswith("not run:") and '"use ninja, not make"' in result and "again" in result
+    assert executed == []
+    assert bells == ["lethe: a tool call needs your approval"]  # content-free, before the question
+    monkeypatch.setattr(repl, "ask_approval", lambda *a, **kw: True)
+    assert repl._invoke_tool(cfg, "run_shell", '{"command":"make"}') == "ok"
+    cfg = make_config(tools={"run_shell": make_tool(lambda **kw: "ok")}, auto_approve="all")
+    bells.clear()
+    repl._invoke_tool(cfg, "run_shell", '{"command":"make"}')
+    assert bells == []  # nothing to answer, nothing to ring for

@@ -11,3 +11,15 @@ lethe.toml
 /rehab
 /run
 /deepfake
+
+# local conversations, transcripts, and research scratch files
+/conspiracy
+/hunt-build
+/mahjong
+/mt64
+/etc/
+/rogue-swarm-data/
+/ROGUE-SWARM-BUILD.md
+/ROGUE-SWARM-HUNT.md
+/tragedy.md
+/BUG-tool-call-limit-final-answer.md

@@ -69,6 +69,7 @@ class Conversation:
     created: float = field(default_factory=time.time)
     updated: float = field(default_factory=time.time)
     title: str = ""
+    interrupted: bool = False  # the last turn was stopped with Ctrl-C; the next prompt says so
 
     @classmethod
     def new(cls, model: str) -> "Conversation":

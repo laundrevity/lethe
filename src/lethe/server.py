@@ -1,28 +1,30 @@
-"""Launch and talk to llama-server.
+"""Run llama-server for one `lethe` session and talk to it.
+
+The server belongs to the `lethe` process that started it: it comes up when a chat
+(or benchmark) starts and is killed when that ends, however it ends. There is no
+daemon to discover, no pid file, and nothing left holding the model afterwards.
 
 Privacy posture (the default, see README "Logless by default"):
-  * llama-server runs with --log-disable, --no-webui, --no-slots; stdout/stderr go to /dev/null.
-    Nothing it sees is written anywhere. `serve --log` opts in to a log file for debugging.
-  * No pid file / state file. A running server is found by inspecting the process table.
-  * Bound to 127.0.0.1 only.
+  * llama-server runs with --log-disable, --no-webui, --no-slots; its output goes to
+    /dev/null unless `--debug-server` shows it on the terminal. Nothing is written anywhere.
+  * Bound to 127.0.0.1 on a free port, with a per-launch random API key.
 """
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
-import shlex
 import signal
+import socket
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import httpx
 
 from .paths import llama_bin, state_dir
-
-DEFAULT_PORT = 8080
 
 
 @dataclass
@@ -42,9 +44,9 @@ class ServeConfig:
     thinking: bool = True
     reasoning_effort: str | None = None  # xhigh|medium|low (Qwen3.8)
     host: str = "127.0.0.1"
-    port: int = DEFAULT_PORT
+    port: int = 0  # 0: pick a free one when the session starts
     no_mmap: bool = False
-    log: bool = False  # opt-in: keep llama-server's log in .lethe/server.log
+    debug: bool = False  # show llama-server's own output on the terminal (nothing is written to disk)
     api_key: str | None = None  # per-launch random key: blocks other local software / web pages from using the model
     extra: list[str] = field(default_factory=list)
 
@@ -67,7 +69,7 @@ class ServeConfig:
             "--no-webui",   # the browser UI keeps chat history in the browser; we never serve it
             "--no-slots",   # /slots would expose the live prompt text over HTTP
         ]
-        if not self.log:
+        if not self.debug:
             a.append("--log-disable")
         if self.api_key:
             a += ["--api-key", self.api_key]
@@ -90,10 +92,11 @@ class ServeConfig:
 
 
 def log_path() -> Path:
+    """Where older versions kept an opt-in server log; only `traces` still looks for it."""
     return state_dir() / "server.log"
 
 
-def base_url(port: int = DEFAULT_PORT, host: str = "127.0.0.1") -> str:
+def base_url(port: int, host: str = "127.0.0.1") -> str:
     return f"http://{host}:{port}"
 
 
@@ -119,102 +122,88 @@ def new_api_key() -> str:
     return secrets.token_urlsafe(24)
 
 
-def _argv_value(argv: list[str], flag: str) -> str | None:
-    try:
-        return argv[argv.index(flag) + 1]
-    except (ValueError, IndexError):
-        return None
+def free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
-def running_servers() -> list[dict]:
-    """Find our llama-server processes from the process table (no state file)."""
-    exe = str(llama_bin("llama-server"))
-    try:
-        out = subprocess.run(["ps", "-axo", "pid=,rss=,args="], capture_output=True, text=True, check=True).stdout
-    except Exception:
-        return []
-    found = []
-    for line in out.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) < 3:
-            continue
-        pid_s, rss_kb, args = parts
-        if not args.startswith(exe):
-            continue
-        argv = shlex.split(args)
-        port = int(_argv_value(argv, "--port") or DEFAULT_PORT)
-        host = _argv_value(argv, "--host") or "127.0.0.1"
-        found.append({
-            "pid": int(pid_s),
-            "rss": int(rss_kb) * 1024,
-            "url": base_url(port, host),
-            "port": port,
-            "model": _argv_value(argv, "--model") or "?",
-            "api_key": _argv_value(argv, "--api-key"),
-            "argv": argv,
-            "logging": "--log-disable" not in argv,
-        })
-    return found
+class Session:
+    """A llama-server that lives exactly as long as the `with` block that starts it.
 
+    Leaving the block kills it, whether the block ends normally, with an exception,
+    with Ctrl-C or Ctrl-D, or because the process got SIGTERM or SIGHUP (closed
+    terminal). Only SIGKILL of lethe itself can leave the server behind.
+    """
 
-def running_server(port: int | None = None) -> dict | None:
-    """The healthy server on `port` (or any port if None)."""
-    for rec in running_servers():
-        if port is not None and rec["port"] != port:
-            continue
-        if is_healthy(rec["url"], timeout=3):
-            return rec
-    return None
+    def __init__(self, cfg: ServeConfig, on_wait=None):
+        if not cfg.port:
+            cfg = replace(cfg, port=free_port())
+        self.cfg = cfg
+        self.url = base_url(cfg.port, cfg.host)
+        self.api_key = cfg.api_key
+        self.model = str(cfg.model)
+        self.on_wait = on_wait
+        self.proc: subprocess.Popen | None = None
+        self._previous_handlers: dict[int, object] = {}
 
-
-def start(cfg: ServeConfig, wait: bool = True, on_wait=None) -> dict:
-    """Spawn llama-server detached and wait for /health. Writes nothing unless cfg.log."""
-    argv = cfg.argv()
-    if cfg.log:
-        sink = open(log_path(), "ab")
-        sink.write(f"\n=== {time.strftime('%F %T')} ===\n$ {shlex.join(argv)}\n".encode())
-        sink.flush()
-    else:
-        sink = subprocess.DEVNULL
-    proc = subprocess.Popen(argv, stdout=sink, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
-    url = base_url(cfg.port, cfg.host)
-    rec = {"pid": proc.pid, "url": url, "port": cfg.port, "model": str(cfg.model), "argv": argv, "logging": cfg.log, "api_key": cfg.api_key}
-    if not wait:
-        return rec
-    t0 = time.time()
-    while True:
-        if proc.poll() is not None:
-            hint = f"Log tail:\n{log_path().read_bytes()[-4000:].decode(errors='replace')}" if cfg.log else \
-                "Re-run with --log (or --fg) to see llama-server's output."
-            raise RuntimeError(f"llama-server exited with {proc.returncode}. {hint}")
-        if is_healthy(url):
-            return rec
-        if on_wait:
-            on_wait(time.time() - t0)
-        time.sleep(0.5)
-
-
-def stop(port: int | None = None) -> int:
-    """SIGTERM every lethe llama-server (or just the one on `port`). Returns count stopped."""
-    n = 0
-    for rec in running_servers():
-        if port is not None and rec["port"] != port:
-            continue
-        pid = rec["pid"]
+    def __enter__(self) -> "Session":
+        argv = self.cfg.argv()
+        # Its own process group: the terminal's Ctrl-C reaches lethe, which decides what to do;
+        # it never half-kills the server.
+        self.proc = subprocess.Popen(
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=None if self.cfg.debug else subprocess.DEVNULL, start_new_session=True,
+        )
+        self._arm()
+        t0 = time.time()
         try:
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
-        except ProcessLookupError:
-            continue
-        for _ in range(40):
+            while not is_healthy(self.url):
+                if self.proc.poll() is not None:
+                    raise RuntimeError(
+                        f"llama-server exited with {self.proc.returncode}; run with --debug-server to see its output"
+                    )
+                if self.on_wait:
+                    self.on_wait(time.time() - t0)
+                time.sleep(0.5)
+        except BaseException:
+            self.stop()
+            raise
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.stop()
+
+    def _arm(self) -> None:
+        """Make sure the server dies with us, not only when the `with` block is left cleanly."""
+        atexit.register(self.stop)
+        for signum in (signal.SIGTERM, signal.SIGHUP):
             try:
-                os.kill(pid, 0)
-                time.sleep(0.25)
-            except ProcessLookupError:
-                break
-        else:
+                self._previous_handlers[signum] = signal.signal(signum, self._on_signal)
+            except ValueError:  # not the main thread
+                pass
+
+    def _disarm(self) -> None:
+        atexit.unregister(self.stop)
+        for signum, previous in self._previous_handlers.items():
+            signal.signal(signum, previous)
+        self._previous_handlers.clear()
+
+    def _on_signal(self, signum, frame) -> None:
+        self.stop()
+        raise SystemExit(128 + signum)
+
+    def stop(self) -> None:
+        proc, self.proc = self.proc, None
+        if proc is None:
+            return
+        self._disarm()
+        if proc.poll() is None:
             try:
-                os.killpg(os.getpgid(pid), signal.SIGKILL)
+                os.killpg(proc.pid, signal.SIGTERM)
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
             except ProcessLookupError:
                 pass
-        n += 1
-    return n

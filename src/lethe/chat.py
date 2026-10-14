@@ -81,6 +81,8 @@ class Delta:
     content: str = ""
     reasoning: str = ""
     tool_calls: list[dict] | None = None  # complete accumulated calls, yielded once at stream end
+    timings: dict | None = None  # server timings so far (cache_n, prompt_n, predicted_n, …), with every chunk
+    progress: dict | None = None  # prompt processing so far: total, cache, processed (tokens), time_ms
 
 
 def stream_chat(
@@ -94,8 +96,12 @@ def stream_chat(
     api_key: str | None = None,
     tools: list[dict] | None = None,
 ) -> Iterator[Delta | TurnStats]:
-    """Yield Delta chunks (a final one may carry tool_calls), then a final TurnStats."""
-    body: dict = {"messages": messages, "stream": True, "timings_per_token": False}
+    """Yield Delta chunks (a final one may carry tool_calls), then a final TurnStats.
+
+    Every chunk asks for the server's running timings and prompt-processing progress, so the caller
+    can show context use and speed while the reply is still being produced.
+    """
+    body: dict = {"messages": messages, "stream": True, "timings_per_token": True, "return_progress": True}
     if sampling:
         body.update(sampling)
     if max_tokens:
@@ -122,8 +128,11 @@ def stream_chat(
                     done = True
                     break
                 obj = json.loads(data)
-                if "timings" in obj:
-                    timings = obj["timings"]
+                chunk_timings = obj.get("timings") or None
+                progress = obj.get("prompt_progress") or None
+                if chunk_timings:
+                    timings = chunk_timings
+                emitted = False
                 for ch in obj.get("choices", []):
                     d = ch.get("delta", {})
                     if ch.get("finish_reason"):
@@ -137,7 +146,11 @@ def stream_chat(
                         slot["function"]["name"] += f.get("name") or ""
                         slot["function"]["arguments"] += f.get("arguments") or ""
                     if d.get("content") or d.get("reasoning_content"):
-                        yield Delta(content=d.get("content") or "", reasoning=d.get("reasoning_content") or "")
+                        yield Delta(content=d.get("content") or "", reasoning=d.get("reasoning_content") or "",
+                                    timings=chunk_timings, progress=progress)
+                        emitted = True
+                if (chunk_timings or progress) and not emitted:
+                    yield Delta(timings=chunk_timings, progress=progress)  # progress only: tool-call text, prompt processing
     if calls:
         if not done or finish not in {"tool_calls", "stop"}:
             raise RuntimeError("incomplete tool-call response; no tools were executed")

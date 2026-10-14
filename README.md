@@ -13,7 +13,7 @@ in use now: pid 13326 11.8 GiB (llama.cpp) · wired total 4.8 GiB
 $ uv run lethe                    # bare `lethe` = `lethe chat`
 context 262,144 (native max 262,144) · model 29.3 GiB + draft 862 MiB + KV 16.0 GiB (f16, 64 KiB/tok) = 46.1 GiB of 99.0 GiB free now
 speculative: FastMTP draft …FastMTP-32K.gguf (depth 3) · thinking on
-ready in 3.6s at http://127.0.0.1:8080 · n_ctx 262,144 · traceless: no log, no web UI, no slots endpoint
+ready in 3.6s · traceless: no log, no web UI, no slots endpoint; the model is unloaded when you quit
 sampler: qwen3 thinking preset (temp 1.0 top_p 0.95 top_k 20 min_p 0.0) · /help for commands
 you › /file paper.pdf
 paper.pdf attached to your next message (~9,800 tokens)
@@ -29,17 +29,18 @@ So the defaults are:
 
 | surface | default | notes |
 |---|---|---|
-| llama-server log | **off** (`--log-disable`, stdout → `/dev/null`) | `serve --log` opts in to `.lethe/server.log` for debugging; `lethe traces --delete` removes it |
+| llama-server log | **off** (`--log-disable`, output → `/dev/null`) | `chat --debug-server` shows the server's output on the terminal instead; nothing is written |
 | web UI | **off** (`--no-webui`) | the stock UI stores chat history in the browser |
 | `/slots` endpoint | **off** (`--no-slots`) | it exposes the live prompt text over HTTP |
 | `/metrics` | off | |
-| API access | **per-launch random key** (`--api-key`) | other local software — including a web page doing `fetch("http://localhost:8080")` — can't use the model. `lethe key` prints it for clients you trust; `serve --no-api-key` disables |
+| API access | **per-launch random key** (`--api-key`), on a free loopback port | other local software — including a web page doing `fetch("http://localhost:…")` — can't use the model |
 | prompt/KV cache to disk (`--slot-save-path`) | never set | KV lives in GPU-wired memory only |
-| pid / state files | none | running servers are found via the process table |
+| model process | **lives only as long as the chat** | `lethe` starts `llama-server` when it starts and kills it when it exits, however it exits; there is no daemon, no pid file, nothing holding 30 GB between chats |
 | network | `127.0.0.1` only | |
 | `chat` REPL | writes nothing; no history file (Up-arrow recall is in-memory only) | `/wipe` clears the conversation **and** the terminal scrollback |
+| terminal notifications | bell + a fixed phrase ("lethe: reply finished", "lethe: a tool call needs your approval") | Notification Center keeps notification text around, so no conversation content ever goes into one |
 | shell tool | **off**; `chat --tools [--shell-dir PATH]` opts in | read-only/offline macOS sandbox by default; `--shell-mode full` allows writes, network, and your inherited environment. Both modes confirm every command; Lethe keeps command text and captured output in memory unless you save the conversation |
-| saved conversations | **off**; `chat --save` / `/save` opt in **per conversation** | AES-256-GCM, key from your passphrase via scrypt, passphrase never stored; random filenames, title/model inside the ciphertext; `lethe conversations` lists ids only (`--unlock` to see titles), `--delete` overwrites then removes |
+| saved conversations | **off**; `chat --save` / `/save` opt in **per invocation** — `--resume ID` only reads | AES-256-GCM, key from your passphrase via scrypt, passphrase never stored; random filenames, title/model inside the ciphertext; `lethe conversations` lists ids only (`--unlock` to see titles), `--delete` overwrites then removes |
 | clipboard | only on explicit `/copy` | clipboard managers and Universal Clipboard can persist or forward that, so it's never automatic |
 | Hugging Face | telemetry disabled; downloads anonymous unless the repo is gated | what you download is still visible to HF, as with any download |
 | `lethe.toml` | configuration only (default model) | never content |
@@ -50,11 +51,33 @@ files were fetched — no content). `lethe doctor` warns if a log exists. Outsid
 terminal's own scrollback (hence `/wipe`) and your shell history (which records the `lethe chat …`
 command, not what you typed into it).
 
+Saved conversations include the model's thinking, tool calls and tool results inside the encrypted file.
+`--resume ID` replays the saved thinking and tool calls (with result sizes) before continuing. Resuming
+never writes: the file stays as it was unless you also pass `--save`, or type `/save` during the chat — both
+keep saving to the same id with the passphrase you unlocked it with, and the exit line says when a session's
+new turns were not kept.
+`--no-show-thinking` hides thinking in both replay and live output without removing it from saved messages.
+Older saves can replay their tool calls and any thinking they retained, but thinking discarded by earlier
+versions cannot be recovered. Replaying a call never executes it again.
+
 By default `chat` sends a short system prompt telling the model what it is (name, family, developer),
 what it runs on (chip, RAM), the current date and time (refreshed on `--resume`), that the
 conversation is local-only and unobserved, and that post-cutoff reality is real — without that last
 part, models tend to read genuine post-cutoff news as fiction or an evaluation scenario. `--system TEXT`
 replaces it; `--no-system` sends none.
+
+**`LETHE.md` — your standing instructions.** Markdown files appended to the system prompt, the way `CLAUDE.md` and
+`AGENTS.md` work for other agents. Two layers, both optional:
+
+| Layer | File | Applies to |
+|---|---|---|
+| global | `LETHE.md` in the lethe repo root | every chat, from any directory |
+| project | the nearest `LETHE.md` (else `AGENTS.md`) from the launch directory (or `--shell-dir`) upward, stopping at the repository root or your home directory | chats launched in that project |
+
+Project instructions take precedence where the two conflict. The files loaded are listed at launch with their
+approximate token cost; they are only read, never written, and are re-read on `--resume` (replacing the copy saved
+with the conversation). `--no-instructions` skips them, as does `--no-system`; `--system TEXT` keeps them. A
+project file is part of the system prompt, so read an unfamiliar repository's `AGENTS.md` before chatting inside it.
 
 **Internet tools and full-access shell mode are opt-in exceptions to "nothing leaves the machine".** `chat --tools web,fetch`
 gives the model `web_search` (keyless ddgs metasearch over Google/Brave/Bing/Mojeek/…, or your own
@@ -80,8 +103,28 @@ uv run lethe --tools web,fetch,shell         # or name tools explicitly (--shell
 
 The model gets `run_shell(command, cwd=".", timeout_seconds=...)`. Before every execution, Lethe
 shows the mode, workspace or starting directory, and **entire command**, then asks for confirmation (default: no).
+The answer is `y` to run it, `n` (or just Enter) to decline, or `p` — perhaps — to send the model a note instead
+of a verdict: `p use ninja instead`, or `p` and then the note on the next line. Nothing runs on `p`; the model
+gets the note as the call's result and may ask again. The terminal bell rings while a call waits for you.
 `--yes` only affects model downloads; shell approval is always required. `/shell` shows the scope;
 `/shell off` removes the tool. `/web off` only removes internet tools.
+
+The shell brings file tools with it, so the model does not have to build files out of `cat` heredocs and `sed`:
+
+| Tool | Modes | What it does |
+|---|---|---|
+| `read_file(path, offset=1, limit)` | read-only (inside the workspace only), full | UTF-8 text with line numbers, paged at 16,000 chars |
+| `write_file(path, content)` | full only | create a file or replace all of it; parent directories are created |
+| `edit_file(path, old_string, new_string, replace_all=false)` | full only | replace one exact, unique piece of text; failed matches tell the model how to fix the call |
+
+Every file tool call asks for confirmation like a shell command. Writes and edits are shown as a **diff** of exactly
+what will change; an edit that cannot apply is returned to the model without prompting you. Lethe keeps no backups,
+temp files, or edit history. `/shell off` removes these tools too, and `/shell read-only` drops the two write tools.
+
+`--auto-approve files` skips the y/n prompt for the three file tools (shell commands still ask);
+`--auto-approve all` skips it for shell commands too. It is per launch, never a saved setting, and every call and
+diff is still printed. With `all` in full mode the model runs arbitrary commands as you with nobody checking, and
+with `--web` a fetched page can steer what it runs, so prefer `files` unless you are watching.
 
 Any chat can enable tools later, including chats started with no tool flags. Enter these commands
 at the `you ›` prompt; the conversation continues with the new tools on the next message:
@@ -127,7 +170,7 @@ you › Use run_shell to execute exactly `printf lethe-shell-smoke-ok`, then rep
 
 Lethe will show the proposed tool call and ask for approval. Enabling a tool lets the model choose
 when to use it; a hypothetical question may receive an explanation without a call. With thinking
-enabled, the model may reason before requesting the tool; Ctrl-C cancels that turn. Use `/think off`
+enabled, the model may reason before requesting the tool. Use `/think off`
 or launch with `--no-thinking` to disable reasoning. `--no-show-thinking` only hides its display.
 Bare `--tools` (or `--tool`, or `--shell`) enables the shell; `--web --tools` gives internet + shell.
 
@@ -169,21 +212,30 @@ allowed localhost connections in full mode. Ordinary tests also exercise full-mo
 environment/PATH inheritance, confirmation, CLI selection, and enabling/changing tools mid-chat
 without losing history. They also check failed mode changes preserve the previous access.
 
-To check the model → shell → model path against an already-running server on port 8080, run
-`uv run pytest -q -s tests/test_live_tools.py --run-live-tools`. This opt-in test uses the normal
-thinking sampler, approves only the fixed `printf lethe-shell-smoke-ok` command in the read-only
-sandbox, and checks the final answer. It neither starts a server nor saves the conversation.
+To check the model → shell → model path with the default model, run
+`uv run pytest -q -s tests/test_live_tools.py --run-live-tools`. This opt-in test loads the model
+for its own run, uses the normal thinking sampler, approves only the fixed `printf lethe-shell-smoke-ok`
+command in the read-only sandbox, checks the final answer, and does not save the conversation.
 
 ## Setup
 
+Requires Apple Silicon macOS, Xcode Command Line Tools, CMake, and `uv`.
+Model files, local configuration, and encrypted conversations are kept out of Git;
+set the default model and download it on each machine.
+
 ```bash
-git submodule update --init      # vendor/llama.cpp
-scripts/build-llama.sh           # Metal + Accelerate, Release; applies model patches if present
+git clone --recurse-submodules https://github.com/laundrevity/lethe.git
+cd lethe
 uv sync
+uv run lethe pull HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF:Q8_K_P
+scripts/build-llama.sh           # Metal + Accelerate, Release; applies the downloaded FastMTP patch
 uv run lethe doctor              # confirms Metal is linked and reports the GPU memory budget
 uv run lethe default HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF:Q8_K_P
-uv run lethe                     # downloads (with confirmation) on first use, then serves + chats
+uv run lethe                     # loads the model, chats, then unloads it on exit
 ```
+
+For an existing clone, run `git submodule update --init` before building.
+The `improvements` branch is also published; use `git switch improvements` to check it out.
 
 ## Models are `owner/repo:QUANT`
 
@@ -203,24 +255,25 @@ from the GGUF's architecture, following each model card's recommendations; overr
 | `lethe pull owner/repo:QUANT` | download a quant (plus mmproj / draft sidecars) into `models/<owner>--<repo>/` |
 | `lethe models` | the same table for what's on disk, plus what other model processes are holding right now |
 | `lethe default [spec]` | show / set the default model |
-| `lethe serve [spec] [--ctx N] [--kv q8_0] [--no-mtp] [--no-thinking] [--effort xhigh] [--vision]` | launch `llama-server` with the memory plan printed against what is *free now*; defaults to the native max context if it fits |
-| `lethe [chat] [spec] [-f FILE …] [--save] [--resume ID] [--web] [--tools [--shell-mode full] [--shell-dir PATH]] [--system TEXT] [--no-system]` (the command word is optional) | streaming REPL; after every turn: prompt tok/s, gen tok/s, MTP acceptance, context used/total (colored; warns at 80%) |
+| `lethe [chat] [spec] [-f FILE …] [--save] [--resume ID] [--web] [--tools [--shell-mode full] [--shell-dir PATH]] [--system TEXT] [--no-system] [--ctx N] [--kv q8_0] [--no-thinking] [--effort low] [--vision]` (the command word is optional) | loads the model for the session (memory plan printed against what is *free now*; native max context if it fits) and unloads it on exit; streaming REPL (Ctrl-C stops a reply but keeps what it thought and wrote so far; the next prompt tells the model it was cut short); while a reply is produced, a line pinned to the bottom of the terminal shows context used (≈ until the server reports the exact position), the phase (prompt processing with progress, thinking, writing, tool call), tokens and tok/s, and elapsed time; after every turn: prompt tok/s, gen tok/s, MTP acceptance, context used/total (colored; warns at 80%); the terminal bell rings when a reply finishes or a tool call waits for approval (iTerm2, Ghostty, WezTerm and kitty also get a desktop notification — a fixed phrase, never content) |
 | `lethe conversations [--unlock] [--delete ID]` | encrypted saved conversations |
 | `lethe bench [spec] [-d 0,32768]` | `llama-bench` prompt/gen speeds at context depth — **no speculative decoding, this is the floor** |
 | `lethe bench [spec] --server [-d 0,32768]` | through `llama-server`: no-MTP vs embedded MTP vs FastMTP, real tok/s and acceptance |
-| `lethe stop` / `lethe key` / `lethe log` | manage the background server (`log` only has content after `serve --log`) |
 | `lethe traces [--delete]` | list/remove anything written to disk beyond model files |
 | `lethe doctor` | Metal build, memory budget, what's in use, what's on disk |
 
 In the REPL: `/file PATH` and `/image PATH` (with `--vision`) attach to the next message; `/compact`
 summarizes the conversation with the model and continues from the summary; `/think on|off`; `/copy`;
-`/wipe`; `/save`; `/help`. Enter sends; Ctrl+Enter, Shift+Enter, Alt+Enter, Ctrl+J or a trailing `\`
-add a line; multi-line pastes arrive as one message. Apple Terminal sends Ctrl+Enter as plain Enter —
-map Control-Return to `\012` in its Keyboard settings, or use the alternatives.
+`/wipe`; `/save`; `/help`. Enter sends; Option+Enter, Ctrl+J, Shift+Enter, Ctrl+Enter or a trailing `\`
+add a line; multi-line pastes arrive as one message. Shift+Enter and Ctrl+Enter need a terminal that reports
+them — the kitty keyboard protocol (Ghostty, kitty, WezTerm, iTerm2 3.5+; lethe turns it on only while you
+type a line) or xterm's modifyOtherKeys. **Apple Terminal sends both as a plain Enter** and offers no way
+to change that (its key mappings cannot bind Return): use Option+Enter after enabling "Use Option as Meta
+Key" (Settings → Profiles → Keyboard), or Ctrl+J, or remap Shift+Return to Ctrl+J with Karabiner-Elements.
 
-`lethe serve` leaves the server running in the background; `lethe chat` reuses it. It is a stock
-`llama-server`, so anything that speaks the OpenAI API can use `http://127.0.0.1:8080/v1` with the key
-from `lethe key`.
+There is no background server. Each `lethe` run starts its own `llama-server` on a free loopback
+port with a random key and kills it on exit, so nothing holds the model's memory between chats.
+With the model file in the OS cache that costs about three seconds per launch.
 
 ## How the memory columns are computed
 
@@ -255,10 +308,10 @@ Acceptance (and therefore speed) depends on the text: 48% on free prose, 74% on 
 ```
 scripts/build-llama.sh   canonical build (flags documented inside)
 scripts/bump-llama.sh    move to latest upstream llama.cpp, re-apply the FastMTP patch, rebuild, verify
-src/lethe/               cli.py · repl.py · server.py · chat.py · spec.py · profiles.py · vault.py ·
-                         tools.py · shell.py · attachments.py · benchserver.py · hub.py · ggufmeta.py · sysinfo.py · config.py · paths.py
+src/lethe/               cli.py · repl.py · terminal.py · server.py · chat.py · spec.py · profiles.py · vault.py ·
+                         tools.py · shell.py · files.py · instructions.py · attachments.py · benchserver.py · hub.py · ggufmeta.py · sysinfo.py · config.py · paths.py
 tests/                   pytest (uv run pytest)
 vendor/llama.cpp         submodule; the FastMTP patch is committed on local branch `lethe-fastmtp`
 models/                  downloaded GGUFs (gitignored)
-.lethe/                  empty unless you opted in to --log or --save (gitignored)
+.lethe/                  empty unless you opted in to --save (gitignored)
 ```
