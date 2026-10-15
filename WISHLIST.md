@@ -1,5 +1,4 @@
-- add new option for responding to tool call besides y/n - p, for provisionally (perhaps), wherein the user can provide clarification
-- save behaves weird - if i save a chat once, then later resume it, it gets "auto saved" in subsequent turns (should not)
+- show output of tool calls
+- stream tool calls as they arrive (rather than waiting for giant command to sudden appear on screen for approval)
+- include flags that were launched when showing resume command after /save (and/or just make --web and shell tools etc default on)
 - notify when requiring tool response in terminal tab (like codex / claude code)
-- shift+enter shouldnt send message, maybe CTRL+J for newline too like codex / claude code
-- always show context usage, even during thinking / tool calls / response
