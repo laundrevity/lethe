@@ -35,6 +35,11 @@ model's inputs and outputs. Every feature must preserve that:
   the per-invocation opt-in `--auto-approve files|all` (calls and diffs are still printed; never make it a default or
   a `lethe.toml` setting). The default system prompt's "nothing leaves this machine" claim is patched by
   `tools.sync_system_text` to match what is enabled.
+- **Media attachments** (`attachments.py`, `video.py`) are explicit (`--vision` plus `/image`, `/video`, or `-f`).
+  Video uses local FFmpeg/ffprobe to sample timestamped PNG frames through stdout pipes only (no audio,
+  network protocols, FFREPORT, cache protocol, or extracted files). The server receives images, never
+  `input_video`; native video decoding is disabled at build time to prevent its disk-backed cache.
+  WebP is converted to PNG the same way. Frames are bounded by `--video-frames` (default 16) and 768px.
 - **Terminal presentation lives in `terminal.py`.** `StatusLine` pins one line to the bottom row during a turn
   (DECSTBM scroll region; Apple Terminal keeps the scrollback for a top-anchored region but drops the pending-wrap
   flag across cursor save/restore — hence the column tracking and no redraw at the right margin). `notify()` is the
@@ -59,12 +64,12 @@ model's inputs and outputs. Every feature must preserve that:
   reasoning flags, or hybrid-attention models. The Python side talks to `llama-server` over HTTP
   (`/v1/chat/completions` streaming; the final chunk's `timings` gives prompt/gen tok/s and
   `draft_n`/`draft_n_accepted`; `/props` gives `n_ctx`).
-- **Submodule pin = upstream master `1729ed5` (2026-08-25) + one local commit** on branch
-  `lethe-fastmtp` applying `models/**/HauhauCS-FastMTP-llama.cpp.patch` (a `d2t` draft-vocab trim in
+- **Submodule pin = upstream master `27c7a769d` (2026-10-16) + one local commit** on branch
+  `lethe-fastmtp` applying `patches/HauhauCS-FastMTP-llama.cpp.patch` (a `d2t` draft-vocab trim in
   `src/models/qwen35.cpp`). The build script applies/commits the patch automatically. Bumping upstream
   means re-running `git apply --check` on that patch; `qwen35.cpp` is the only file it touches.
 - **Build flags are canonical in `scripts/build-llama.sh`.** Metal + Accelerate explicitly ON, Metal
-  shader library embedded, `GGML_NATIVE`, Release, curl OFF, `CMAKE_BUILD_RPATH=@loader_path` (without it
+  shader library embedded, `GGML_NATIVE`, Release, curl OFF, `MTMD_VIDEO=OFF` (native video uses disk cache), `CMAKE_BUILD_RPATH=@loader_path` (without it
   the binaries carry an absolute rpath and break when the repo is moved/renamed — exit -6 from dyld).
   Targets: `llama-server llama-cli llama-bench` (there is no `llama-gguf` target). `lethe doctor` verifies
   Metal is linked and lists devices.

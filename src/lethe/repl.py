@@ -13,7 +13,7 @@ from pathlib import Path
 from rich.console import Console
 
 from . import tools as T, vault
-from .attachments import UnsupportedFile, approx_tokens, file_block, image_data_url, is_image
+from .attachments import UnsupportedFile, approx_tokens, file_block, image_data_url, is_image, is_video
 from .chat import Delta, TurnStats, complete, stream_chat
 from .profiles import Profile, describe
 from .terminal import StatusLine, notify
@@ -45,8 +45,10 @@ HELP = """\
 /reset         clear the conversation (server KV cache is reused only for shared prefixes)
 /wipe          clear the conversation AND the terminal scrollback
 /copy          copy the last reply (without reasoning) to the clipboard
-/file PATH     attach a text/PDF file to your next message (also: lethe -f PATH)
-/image PATH    attach an image to your next message (needs `serve --vision`)
+/file PATH     attach text/PDF/image/video to your next message (also: lethe -f PATH)
+/image PATH    attach an image to your next message (needs `lethe --vision`)
+/video PATH    attach sampled video frames, without audio (needs --vision and FFmpeg)
+               up to 1 frame/s, spread across the clip; --video-frames sets the cap (default 16)
 /think on|off  toggle reasoning mode (switches the sampler preset too)
 /compact       summarize the conversation so far with the model and continue from the summary
 /save          start saving this conversation, encrypted, to .lethe/conversations/ (asks for a passphrase;
@@ -89,6 +91,7 @@ class ReplConfig:
     sampling_overrides: dict = field(default_factory=dict)
     attachments: list[Path] = field(default_factory=list)
     vision: bool = False
+    video_frames: int = 16
     save: bool = False
     resume: vault.Conversation | None = None
     passphrase: str | None = None
@@ -199,16 +202,23 @@ def _pbcopy(text: str) -> bool:
         return False
 
 
-def _user_content(text: str, files: list[Path], images: list[Path]) -> str | list:
+def _user_content(
+    text: str, files: list[Path], images: list[Path], videos: list[Path] | None = None, *, video_frames: int = 16,
+) -> str | list:
     blocks = []
     for f in files:
         blocks.append(file_block(f))
     body = ("\n\n".join(blocks) + "\n\n" + text) if blocks else text
-    if not images:
+    if not images and not videos:
         return body
     parts = [{"type": "text", "text": body}]
     for im in images:
         parts.append({"type": "image_url", "image_url": {"url": image_data_url(im)}})
+    if videos:
+        from .video import video_parts
+
+        for video in videos:
+            parts.extend(video_parts(video, video_frames))
     return parts
 
 
@@ -477,15 +487,19 @@ def run(cfg: ReplConfig) -> None:
     kwargs = None if (thinking or not cfg.profile.supports_thinking) else cfg.profile.disable_thinking_kwargs
     saving = cfg.save
     passphrase = cfg.passphrase
-    pending_files: list[Path] = list(cfg.attachments)
-    pending_images: list[Path] = []
+    pending_files = [p for p in cfg.attachments if not is_image(p) and not is_video(p)]
+    pending_images = [p for p in cfg.attachments if is_image(p)]
+    pending_videos = [p for p in cfg.attachments if is_video(p)]
+    if (pending_images or pending_videos) and not cfg.vision:
+        con.print("server has no vision projector — start with `lethe … --vision`", style="red")
+        return
     last: TurnStats | None = None
     last_reply = ""
 
     con.print(f"[bold]{cfg.model_spec}[/] · ctx {cfg.n_ctx:,} · {cfg.url}")
     con.print(
         f"[dim]sampler: {cfg.profile.name} {'thinking' if thinking and cfg.profile.supports_thinking else 'instruct'} preset ({describe(sampling)})"
-        + (f" · {len(pending_files)} file(s) attached to the first message" if pending_files else "")
+        + (f" · {len(cfg.attachments)} file(s) attached to the first message" if cfg.attachments else "")
         + (f" · resumed {conv.id}: {conv.turns} turns" if cfg.resume else "")
         + (" · [yellow]saving encrypted[/]" if saving else " · not saving (/save keeps this session's turns)" if cfg.resume else "")
         + (f" · [yellow]tools ON: {', '.join(cfg.tools)}[/]" if cfg.tools else "")
@@ -531,10 +545,12 @@ def run(cfg: ReplConfig) -> None:
                 con.print(HELP, markup=False)
             elif cmd == "reset":
                 messages = [m for m in messages if m["role"] == "system"]
+                pending_files, pending_images, pending_videos = [], [], []
                 last, last_reply = None, ""
                 con.print("[dim]conversation cleared[/]")
             elif cmd == "wipe":
                 messages = [m for m in messages if m["role"] == "system"]
+                pending_files, pending_images, pending_videos = [], [], []
                 last, last_reply = None, ""
                 sys.stdout.write("\x1b[2J\x1b[3J\x1b[H")
                 sys.stdout.flush()
@@ -553,21 +569,36 @@ def run(cfg: ReplConfig) -> None:
                     con.print(f"[dim]copied {len(last_reply):,} chars to the clipboard[/]")
                 else:
                     con.print("[red]pbcopy failed[/]")
-            elif cmd in ("file", "image"):
+            elif cmd in ("file", "image", "video"):
+                # Accept a literal path with spaces or a quoted/terminal-dropped path.
                 p = Path(arg).expanduser()
                 if not p.is_file():
-                    con.print(f"[red]no such file: {arg}[/]")
-                elif cmd == "image" or is_image(p):
+                    try:
+                        words = shlex.split(arg)
+                        if len(words) == 1:
+                            p = Path(words[0]).expanduser()
+                    except ValueError:
+                        pass
+                if not p.is_file():
+                    con.print(_terminal_safe(f"no such file: {arg}"), style="red", markup=False)
+                elif cmd in ("image", "video") or is_image(p) or is_video(p):
                     if not cfg.vision:
-                        con.print("[red]server has no vision projector — start with `lethe serve … --vision`[/]")
+                        con.print("[red]server has no vision projector — start with `lethe … --vision`[/]")
+                    elif cmd == "video" or (cmd == "file" and is_video(p)):
+                        pending_videos.append(p)
+                        con.print(_terminal_safe(
+                            f"video {p.name} attached to your next message (up to {cfg.video_frames} sampled frames; no audio)"
+                        ), style="dim", markup=False)
+                    elif not is_image(p):
+                        con.print("unsupported image extension; use /video for video files", style="red")
                     else:
                         pending_images.append(p)
-                        con.print(f"[dim]image {p.name} attached to your next message[/]")
+                        con.print(_terminal_safe(f"image {p.name} attached to your next message"), style="dim", markup=False)
                 else:
                     try:
                         n = approx_tokens(file_block(p))
-                    except UnsupportedFile as e:
-                        con.print(f"[red]{e}[/]")
+                    except (UnsupportedFile, OSError) as e:
+                        con.print(_terminal_safe(str(e)), style="red", markup=False)
                         continue
                     pending_files.append(p)
                     con.print(f"[dim]{p.name} attached to your next message (~{n:,} tokens)[/]")
@@ -619,11 +650,18 @@ def run(cfg: ReplConfig) -> None:
             continue
 
         try:
-            content = _user_content(user, pending_files, pending_images)
-        except UnsupportedFile as e:
-            con.print(f"[red]{e}[/]")
+            if pending_videos:
+                with con.status("sampling video frames…"):
+                    content = _user_content(user, pending_files, pending_images, pending_videos, video_frames=cfg.video_frames)
+            else:
+                content = _user_content(user, pending_files, pending_images)
+        except (UnsupportedFile, OSError) as e:
+            con.print(_terminal_safe(str(e)), style="red", markup=False)
             continue
-        pending_files, pending_images = [], []
+        except KeyboardInterrupt:
+            con.print("[dim]attachment preparation stopped; attachments kept (/reset clears them)[/]")
+            continue
+        pending_files, pending_images, pending_videos = [], [], []
         if interrupted:
             content = _with_note(content, INTERRUPT_NOTE)
         turn_start = len(messages)

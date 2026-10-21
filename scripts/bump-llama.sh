@@ -10,7 +10,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC="$ROOT/vendor/llama.cpp"
-PATCH_FILE="$(ls "$ROOT"/models/*/HauhauCS-FastMTP-llama.cpp.patch 2>/dev/null | head -1 || true)"
+PATCH_FILE="$ROOT/patches/HauhauCS-FastMTP-llama.cpp.patch"
 TARGET="${1:-origin/master}"
 
 cd "$SRC"
@@ -20,7 +20,7 @@ NEW="$(git rev-parse --short "$TARGET")"
 echo "[bump] $OLD -> $NEW ($(git log -1 --format=%cd --date=short "$TARGET"))"
 echo "[bump] $(git rev-list --count "$OLD".."$TARGET" 2>/dev/null || echo '?') upstream commits"
 
-if [ -n "$PATCH_FILE" ]; then
+if [ -f "$PATCH_FILE" ]; then
   # can the patch apply on the new base?
   if git diff --quiet "$TARGET" -- src/models/qwen35.cpp 2>/dev/null; then :; fi
   git stash -q 2>/dev/null || true

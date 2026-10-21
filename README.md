@@ -39,6 +39,7 @@ So the defaults are:
 | network | `127.0.0.1` only | |
 | `chat` REPL | writes nothing; no history file (Up-arrow recall is in-memory only) | `/wipe` clears the conversation **and** the terminal scrollback |
 | terminal notifications | bell + a fixed phrase ("lethe: reply finished", "lethe: a tool call needs your approval") | Notification Center keeps notification text around, so no conversation content ever goes into one |
+| image/video attachments | explicit `--vision` plus `/image`, `/video`, or `-f` | local files only; decoded video frames and WebP conversions stay in memory; FFmpeg network protocols, reports, and disk caches are disabled; no extracted files or audio transcripts |
 | shell tool | **off**; `chat --tools [--shell-dir PATH]` opts in | read-only/offline macOS sandbox by default; `--shell-mode full` allows writes, network, and your inherited environment. Both modes confirm every command; Lethe keeps command text and captured output in memory unless you save the conversation |
 | saved conversations | **off**; `chat --save` / `/save` opt in **per invocation** — `--resume ID` only reads | AES-256-GCM, key from your passphrase via scrypt, passphrase never stored; random filenames, title/model inside the ciphertext; `lethe conversations` lists ids only (`--unlock` to see titles), `--delete` overwrites then removes |
 | clipboard | only on explicit `/copy` | clipboard managers and Universal Clipboard can persist or forward that, so it's never automatic |
@@ -228,7 +229,7 @@ git clone --recurse-submodules https://github.com/laundrevity/lethe.git
 cd lethe
 uv sync
 uv run lethe pull HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF:Q8_K_P
-scripts/build-llama.sh           # Metal + Accelerate, Release; applies the downloaded FastMTP patch
+scripts/build-llama.sh           # Metal + Accelerate, Release; applies the versioned FastMTP patch
 uv run lethe doctor              # confirms Metal is linked and reports the GPU memory budget
 uv run lethe default HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF:Q8_K_P
 uv run lethe                     # loads the model, chats, then unloads it on exit
@@ -262,7 +263,7 @@ from the GGUF's architecture, following each model card's recommendations; overr
 | `lethe traces [--delete]` | list/remove anything written to disk beyond model files |
 | `lethe doctor` | Metal build, memory budget, what's in use, what's on disk |
 
-In the REPL: `/file PATH` and `/image PATH` (with `--vision`) attach to the next message; `/compact`
+In the REPL: `/file PATH`, `/image PATH`, and `/video PATH` (media needs `--vision`) attach to the next message; `/compact`
 summarizes the conversation with the model and continues from the summary; `/think on|off`; `/copy`;
 `/wipe`; `/save`; `/help`. Enter sends; Option+Enter, Ctrl+J, Shift+Enter, Ctrl+Enter or a trailing `\`
 add a line; multi-line pastes arrive as one message. Shift+Enter and Ctrl+Enter need a terminal that reports
@@ -274,6 +275,54 @@ Key" (Settings → Profiles → Keyboard), or Ctrl+J, or remap Shift+Return to C
 There is no background server. Each `lethe` run starts its own `llama-server` on a free loopback
 port with a random key and kills it on exit, so nothing holds the model's memory between chats.
 With the model file in the OS cache that costs about three seconds per launch.
+
+## Images and video
+
+Qwen3.8 Flash Next supports visual input. The language GGUF needs its matching `mmproj` projector;
+Lethe looks beside the model and up to that model repository's root, including models whose shards
+are under a quant directory. F16 is preferred when both F16 and BF16 projectors are present.
+An explicit `--vision` fails early if no projector is found, and its size is included in the memory plan.
+
+For the downloaded Unsloth UD-IQ4_XS quant (displayed by Lethe as `IQ4_XS`):
+
+```bash
+uv run lethe unsloth/Qwen3.8-Flash-Next-GGUF:IQ4_XS --vision --ctx 16384 --no-thinking
+```
+
+Then attach a file and ask a question:
+
+```text
+/image /absolute/path/to/photo.png
+Describe the image and read any visible text.
+/video "/absolute/path/to/short clip.mp4"
+Describe what changes over time.
+```
+
+You can also start with `--vision -f photo.png -f clip.mp4`; attachments go with your first message.
+`/file` detects images and videos too. Images support PNG, JPEG, GIF (first frame), BMP, and WebP.
+Video supports local MP4, MOV, M4V, MKV, WebM, AVI, MPEG, and MPG files that FFmpeg can decode.
+Video and WebP require `ffmpeg` and `ffprobe` on PATH (`brew install ffmpeg`).
+
+Video is sent as chronological images with timestamps: up to one frame per second, capped at
+16 frames spread across the whole clip, scaled to at most 768 pixels per edge. Use
+`--video-frames 32` (1–128) to raise the cap; more frames use more context and take longer.
+Brief events between samples can be missed. **Audio is not included.** Start with a short clip;
+this is sampled visual understanding, not exhaustive frame-by-frame analysis.
+
+FFmpeg reads the existing local file and outputs PNGs through a pipe; Lethe never writes decoded
+media or sends it to a remote service. The native llama.cpp video decoder is disabled at build
+time because its `cache:` protocol uses temporary files. WebP is converted to PNG through the same
+memory-only path. `/reset` and `/wipe` also clear pending attachments. As with other conversation
+content, `--save` or `/save` explicitly includes the attached images and sampled frames in the encrypted vault.
+
+To run a repeatable local check with synthetic images/video and the Unsloth model:
+
+```bash
+uv run pytest -q -s -p no:cacheprovider tests/test_live_media.py --run-live-media
+```
+
+This opt-in test creates only fixed test fixtures, checks image color recognition and video color
+order, and unloads the model afterward. Use `--media-model owner/repo:QUANT` to test another model.
 
 ## How the memory columns are computed
 

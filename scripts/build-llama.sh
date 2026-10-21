@@ -11,6 +11,7 @@
 #   GGML_ACCELERATE=ON          Apple Accelerate for the CPU-side BLAS bits
 #   GGML_NATIVE=ON              -mcpu=native for this exact chip
 #   LLAMA_CURL=OFF              we download with huggingface_hub, not llama-server
+#   MTMD_VIDEO=OFF              native FFmpeg cache: writes temp files; lethe decodes frames in RAM
 #   CMAKE_BUILD_RPATH=@loader_path  relative rpath so the build survives moving/renaming the repo
 set -euo pipefail
 
@@ -38,8 +39,8 @@ fi
 
 # --- optional model-specific patch (HauhauCS FastMTP draft-vocab trim) -------------------
 # Applied as a commit on a local branch so the submodule stays clean and the build is recorded.
-PATCH_FILE="$(ls "$ROOT"/models/*/HauhauCS-FastMTP-llama.cpp.patch 2>/dev/null | head -1 || true)"
-if [ "$PATCH" = 1 ] && [ -n "$PATCH_FILE" ]; then
+PATCH_FILE="$ROOT/patches/HauhauCS-FastMTP-llama.cpp.patch"
+if [ "$PATCH" = 1 ] && [ -f "$PATCH_FILE" ]; then
   (
     cd "$SRC"
     if git apply --check -R "$PATCH_FILE" >/dev/null 2>&1; then
@@ -65,6 +66,7 @@ cmake -S "$SRC" -B "$BUILD" \
   -DGGML_ACCELERATE=ON \
   -DGGML_NATIVE=ON \
   -DLLAMA_CURL=OFF \
+  -DMTMD_VIDEO=OFF \
   -DLLAMA_BUILD_TESTS=OFF \
   -DLLAMA_BUILD_EXAMPLES=OFF \
   -DLLAMA_BUILD_TOOLS=ON \
