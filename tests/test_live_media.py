@@ -11,7 +11,7 @@ import zlib
 
 import pytest
 
-from lethe import cli, repl, server, spec, video
+from lethe import cli, repl, server, spec, tools, video
 from lethe.chat import Delta, TurnStats, stream_chat
 from lethe.profiles import profile_for
 
@@ -85,3 +85,54 @@ def test_live_image_and_video(request, tmp_path):
             assert stats and stats.finish_reason == "stop"
     assert proc.poll() is not None, "test server was not unloaded"
     print("Image and video smoke tests passed; the model was unloaded.")
+
+
+def test_live_image_tool(request, tmp_path):
+    if not request.config.getoption("--run-live-media"):
+        pytest.skip("pass --run-live-media to load the model")
+    if request.config.getoption("capture") != "no":
+        pytest.fail("use -s for live tests so replies are not captured in temporary files")
+
+    (tmp_path / "colors.png").write_bytes(_two_squares())
+    model = spec.resolve(request.config.getoption("--media-model"))
+    profile = profile_for(cli._shape(model.path))
+    registry = {"view_image": tools.build_image_tool(tmp_path, confined=True)}
+    messages = [{"role": "user", "content": (
+        "Use view_image to open colors.png. What two colors are the squares? "
+        "After opening the image, reply only with the colors in left-to-right order."
+    )}]
+    inspected, answer = False, ""
+    with cli._start(model, ctx=16384, kv="f16", vision=True, thinking=False, effort=None) as srv:
+        proc = srv.proc
+        cfg = repl.ReplConfig(
+            srv.url, srv.api_key, 16384, model.spec, profile,
+            vision=True, tools=registry, auto_approve="files",
+        )
+        for _ in range(3):
+            calls, text, reasoning = [], [], []
+            for event in stream_chat(
+                srv.url, messages, n_ctx=16384,
+                sampling={**profile.sampling(False), "temperature": 0}, max_tokens=512,
+                chat_template_kwargs=profile.disable_thinking_kwargs, api_key=srv.api_key,
+                tools=[t.spec() for t in registry.values()],
+            ):
+                if isinstance(event, Delta):
+                    text.append(event.content)
+                    if event.reasoning:
+                        reasoning.append(event.reasoning)
+                    calls.extend(event.tool_calls or [])
+            messages.append(repl._assistant_message(text, reasoning, calls or None))
+            if not calls:
+                answer = "".join(text).strip()
+                break
+            for call in calls:
+                assert call["function"]["name"] == "view_image"
+                result = repl._invoke_tool(cfg, "view_image", call["function"]["arguments"])
+                assert isinstance(result, list), result
+                messages.append({"role": "tool", "tool_call_id": call["id"], "name": "view_image", "content": result})
+                inspected = True
+        print(f"Image tool: {answer}", flush=True)
+        assert inspected, "model answered without opening the image"
+        normalized = answer.lower()
+        assert 0 <= normalized.find("red") < normalized.find("blue"), "wrong colors/order"
+    assert proc.poll() is not None, "test server was not unloaded"

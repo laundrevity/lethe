@@ -42,7 +42,7 @@ So the defaults are:
 | `chat` REPL | writes nothing; no history file (Up-arrow recall is in-memory only) | `/wipe` clears the conversation **and** the terminal scrollback |
 | terminal notifications | bell + a fixed phrase ("lethe: reply finished", "lethe: a tool call needs your approval") | Notification Center keeps notification text around, so no conversation content ever goes into one |
 | shell and file tools | **on, full access** (equivalent to `--tools --shell-mode full`) | commands and file operations require approval; writes show a diff. `--no-tools` disables tools; `--shell-mode read-only` selects the offline macOS sandbox. Full mode allows writes, network, and inherited environment; command side effects can persist |
-| image/video attachments | explicit `--vision` plus `/image`, `/video`, or `-f` | local files only; decoded video frames and WebP conversions stay in memory; FFmpeg network protocols, reports, and disk caches are disabled; no extracted files or audio transcripts |
+| image/video attachments and image tool | explicit `--vision` enables `view_image`; `/image`, `/video`, or `-f` attach media manually | local files only; image tool calls require approval unless `--auto-approve files\|all` is set; `--no-tools` disables the tool; decoded video frames and WebP conversions stay in memory; FFmpeg network protocols, reports, and disk caches are disabled; no extracted files or audio transcripts |
 | saved conversations | **off**; `chat --save` / `/save` opt in **per invocation** — `--resume ID` only reads | AES-256-GCM, key from your passphrase via scrypt, passphrase never stored; random filenames, title/model inside the ciphertext; `lethe conversations` lists ids only (`--unlock` to see titles), `--delete` overwrites then removes |
 | clipboard | only on explicit `/copy` | clipboard managers and Universal Clipboard can persist or forward that, so it's never automatic |
 | Hugging Face | telemetry disabled; downloads anonymous unless the repo is gated | what you download is still visible to HF, as with any download |
@@ -126,7 +126,7 @@ Every file tool call asks for confirmation like a shell command. Writes and edit
 what will change; an edit that cannot apply is returned to the model without prompting you. Lethe keeps no backups,
 temp files, or edit history. `/shell off` removes these tools too, and `/shell read-only` drops the two write tools.
 
-`--auto-approve files` skips the y/n prompt for the three file tools (shell commands still ask);
+`--auto-approve files` skips the y/n prompt for file tools, including `view_image` when enabled (shell commands still ask);
 `--auto-approve all` skips it for shell commands too. It is per launch, never a saved setting, and every call and
 diff is still printed. With `all` in full mode the model runs arbitrary commands as you with nobody checking, and
 with `--web` a fetched page can steer what it runs, so prefer `files` unless you are watching.
@@ -315,6 +315,17 @@ Qwen3.8 Flash Next supports visual input. The language GGUF needs its matching `
 Lethe looks beside the model and up to that model repository's root, including models whose shards
 are under a quant directory. F16 is preferred when both F16 and BF16 projectors are present.
 An explicit `--vision` fails early if no projector is found, and its size is included in the memory plan.
+
+`--vision` also enables the model's `view_image(path)` tool automatically, even with only web tools
+selected. You can ask it to inspect `screenshots/error.png` without attaching it first. Paths are
+relative to the session's starting directory (or `--shell-dir`); absolute paths and `~` work too.
+With `--shell-mode read-only`, paths must stay within that workspace, including symlink targets.
+Each call asks for approval; `n` declines and `p` sends your note without reading the image.
+`--auto-approve files` or `all` skips the prompt. The image goes directly into the tool reply in
+memory, using the same loader as `/image`; WebP conversion writes no temporary files.
+`--no-tools` or `/tools off` disables the tool while manual attachments remain available.
+`/shell off` leaves image inspection enabled; changing the shell mode or directory updates its
+path rules. `/tools full` restores it in a vision session.
 
 For the downloaded Unsloth UD-IQ4_XS quant (displayed by Lethe as `IQ4_XS`):
 

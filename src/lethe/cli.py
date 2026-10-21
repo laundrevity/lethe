@@ -433,7 +433,7 @@ def chat(
     kv: str = typer.Option("f16", help="KV cache type: f16|q8_0|q4_0"),
     thinking: bool = typer.Option(True, help="Thinking mode (server-side default + sampler preset)"),
     show_thinking: bool = typer.Option(True, help="Stream the model's reasoning (dimmed)"),
-    vision: bool = typer.Option(False, help="Load the vision projector for images and sampled video frames"),
+    vision: bool = typer.Option(False, help="Load the vision projector for images and sampled video frames; enable the view_image tool unless --no-tools"),
     video_frames: int = typer.Option(16, min=1, max=128, help="Maximum sampled frames per video (up to 1 frame/second; no audio)"),
     system: Optional[str] = typer.Option(None, help="System prompt"),
     file: list[Path] = typer.Option([], "--file", "-f", help="Attach text/PDF/image/video to the first message (repeatable; media needs --vision)"),
@@ -452,7 +452,7 @@ def chat(
     searx: Optional[str] = typer.Option(None, "--searx", help="Back web search with this SearXNG instance URL instead of the ddgs metasearch"),
     no_instructions: bool = typer.Option(False, "--no-instructions", help="Do not load LETHE.md instruction files (global: the lethe repo's LETHE.md; project: nearest LETHE.md or AGENTS.md from the launch directory up)"),
     tools_confirm: bool = typer.Option(False, "--tools-confirm", help="Ask y/n before every tool call (shell commands always ask)"),
-    auto_approve: Optional[str] = typer.Option(None, "--auto-approve", help="OPT-IN: skip the y/n prompt. files = read_file/write_file/edit_file run unasked (shell still asks); all = shell commands too. Calls and diffs are still printed"),
+    auto_approve: Optional[str] = typer.Option(None, "--auto-approve", help="OPT-IN: skip the y/n prompt. files = read_file/view_image/write_file/edit_file run unasked (shell still asks); all = shell commands too. Calls and diffs are still printed"),
     save: bool = typer.Option(False, "--save", help="OPT-IN: save this conversation encrypted (asks for a passphrase; with --resume, keeps saving to that id)"),
     resume: Optional[str] = typer.Option(None, "--resume", help="Continue a saved conversation by id (see lethe conversations). Reads only: new turns are saved only with --save or /save"),
     effort: Optional[str] = typer.Option(None, "--effort", help="Reasoning effort: low|medium|xhigh (Qwen3.8; the template's default is xhigh)"),
@@ -530,6 +530,10 @@ def chat(
         p = server.props(srv.url, srv.api_key)
         n_ctx = int(p.get("default_generation_settings", {}).get("n_ctx", 0))
         has_vision = bool((p.get("modalities") or {}).get("vision"))
+        if has_vision and not no_tools:
+            tool_registry["view_image"] = T.build_image_tool(
+                shell_dir if shell_dir is not None else Path.cwd(), confined=shell_mode != ShellMode.FULL,
+            )
         sh = _shape(lm.path)
         if system is None and not no_system:
             system = T.sync_system_text(_default_system(lm, sh), tool_registry)
