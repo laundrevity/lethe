@@ -12,6 +12,7 @@ TEXT_SUFFIXES = {
     ".go", ".java", ".kt", ".swift", ".rb", ".php", ".sql", ".tex", ".log", ".diff", ".patch", ".m", ".mm", ".r",
 }
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi", ".mpeg", ".mpg"}
 
 
 class UnsupportedFile(Exception):
@@ -47,12 +48,22 @@ def is_image(path: Path) -> bool:
     return path.suffix.lower() in IMAGE_SUFFIXES
 
 
+def is_video(path: Path) -> bool:
+    return path.suffix.lower() in VIDEO_SUFFIXES
+
+
 def file_block(path: Path) -> str:
     text = read_text(path)
     return f'<file name="{path.name}">\n{text}\n</file>'
 
 
 def image_data_url(path: Path) -> str:
+    if path.suffix.lower() == ".webp":
+        # llama.cpp's WebP fallback uses FFmpeg's disk-backed cache protocol.
+        # Decode the selected local file directly instead, keeping PNG in RAM.
+        from .video import image_png
+
+        return "data:image/png;base64," + base64.b64encode(image_png(path)).decode()
     mime = mimetypes.guess_type(str(path))[0] or "image/png"
     return f"data:{mime};base64," + base64.b64encode(path.read_bytes()).decode()
 

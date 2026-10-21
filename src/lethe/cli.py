@@ -15,6 +15,7 @@ from rich.console import Console
 from rich.table import Table
 
 from . import config, hub, server, spec as S, tools as T, vault
+from .attachments import is_image, is_video
 from .ggufmeta import ModelShape, parse_local, quant_from_filename, shape_from_kv
 from .paths import llama_bin, llama_dir, models_dir
 from .profiles import profile_for
@@ -153,21 +154,31 @@ def _pull(repo: str, g: hub.HubGguf, ggufs: list[hub.HubGguf], sidecars: bool = 
 
 
 def _find_sidecar(lm: S.LocalModel, kind: str) -> Path | None:
-    for p in lm.path.parent.glob("*.gguf"):
-        n = p.name.lower()
-        if kind == "draft" and ("fastmtp" in n or n.startswith("mtp-")):
-            return p
-        if kind == "mmproj" and n.startswith("mmproj"):
-            return p
+    directories = [lm.path.parent]
+    # Sharded quants often live in a subdirectory, with a shared projector at
+    # the repo root. Never search another model's directory for a projector.
+    if kind == "mmproj" and lm.repo:
+        root = models_dir() / S.local_dir_name(lm.repo)
+        if lm.path.is_relative_to(root):
+            while directories[-1] != root:
+                directories.append(directories[-1].parent)
+    for directory in directories:
+        candidates = sorted(directory.glob("*.gguf"), key=lambda p: (not p.stem.lower().endswith("-f16"), p.name))
+        for p in candidates:
+            n = p.name.lower()
+            if kind == "draft" and ("fastmtp" in n or n.startswith("mtp-")):
+                return p
+            if kind == "mmproj" and n.startswith("mmproj"):
+                return p
     return None
 
 
-def _plan_ctx(shape: ModelShape, size: int, ctx: int, kv: str, draft_size: int) -> int:
+def _plan_ctx(shape: ModelShape, size: int, ctx: int, kv: str, draft_size: int, mmproj_size: int = 0) -> int:
     """Pick/validate a context size against what is free *now* and print the memory plan."""
     m = machine()
     kvb = KV_BYTES[kv]
     per = shape.kv_bytes_per_token(kvb)
-    fixed = size + draft_size
+    fixed = size + draft_size + mmproj_size
     capacity = m.usable_for_model
     available = m.available_now()
     budget = min(capacity, available)
@@ -184,6 +195,7 @@ def _plan_ctx(shape: ModelShape, size: int, ctx: int, kv: str, draft_size: int) 
         f"context [bold]{ctx:,}[/] (native max {shape.n_ctx_train:,}) · "
         f"model {fmt_bytes(size)}"
         + (f" + draft {fmt_bytes(draft_size)}" if draft_size else "")
+        + (f" + vision {fmt_bytes(mmproj_size)}" if mmproj_size else "")
         + f" + KV {fmt_bytes(kv_total)} ({kv}, {per / 1024:.0f} KiB/tok"
         + (f" + {fmt_bytes(shape.kv_fixed_bytes(kvb))} in {shape.n_swa_layers} sliding-window layers" if shape.swa_window else "")
         + f") = [{color}]{fmt_bytes(total)}[/]"
@@ -203,15 +215,15 @@ def _start(
 ) -> Iterator[server.Session]:
     """A server for this run only: `with _start(...) as srv:` kills it on the way out."""
     shape = _shape(lm.path)
+    mmproj = _find_sidecar(lm, "mmproj") if vision else None
+    if vision and not mmproj:
+        raise typer.BadParameter("no mmproj found beside the model or in its model repository", param_hint="--vision")
     draft_path = _find_sidecar(lm, "draft") if (mtp and draft) else None
     draft_size = draft_path.stat().st_size if draft_path else 0
-    ctx = _plan_ctx(shape, lm.size, ctx, kv, draft_size)
+    ctx = _plan_ctx(shape, lm.size, ctx, kv, draft_size, mmproj.stat().st_size if mmproj else 0)
     if mtp and not shape.has_mtp and not draft_path:
         con.print("[yellow]model has no MTP head; disabling speculative decoding[/]")
         mtp = False
-    mmproj = _find_sidecar(lm, "mmproj") if vision else None
-    if vision and not mmproj:
-        con.print("[yellow]no mmproj next to the model; vision off[/]")
     cfg = server.ServeConfig(
         model=lm.path, n_ctx=ctx, draft=draft_path, mtp=mtp, mmproj=mmproj, kv_type=kv,
         thinking=thinking, reasoning_effort=effort, debug=debug, api_key=server.new_api_key(),
@@ -421,9 +433,10 @@ def chat(
     kv: str = typer.Option("f16", help="KV cache type: f16|q8_0|q4_0"),
     thinking: bool = typer.Option(True, help="Thinking mode (server-side default + sampler preset)"),
     show_thinking: bool = typer.Option(True, help="Stream the model's reasoning (dimmed)"),
-    vision: bool = typer.Option(False, help="Load the vision projector so /image works"),
+    vision: bool = typer.Option(False, help="Load the vision projector for images and sampled video frames"),
+    video_frames: int = typer.Option(16, min=1, max=128, help="Maximum sampled frames per video (up to 1 frame/second; no audio)"),
     system: Optional[str] = typer.Option(None, help="System prompt"),
-    file: list[Path] = typer.Option([], "--file", "-f", help="Attach text/PDF file(s) to the first message (repeatable)"),
+    file: list[Path] = typer.Option([], "--file", "-f", help="Attach text/PDF/image/video to the first message (repeatable; media needs --vision)"),
     max_tokens: Optional[int] = typer.Option(None, help="Cap generation length per turn"),
     temp: Optional[float] = typer.Option(None, help="Override sampler temperature"),
     top_p: Optional[float] = typer.Option(None, help="Override top_p"),
@@ -450,6 +463,9 @@ def chat(
     for f in file:
         if not f.is_file():
             err.print(f"[red]no such file: {f}[/]")
+            raise typer.Exit(1)
+        if (is_image(f) or is_video(f)) and not vision:
+            err.print("image/video attachments require --vision", style="red")
             raise typer.Exit(1)
     if no_tools and (web or shell or tools not in (None, "shell")):
         raise typer.BadParameter("--no-tools cannot be combined with tool-enabling options")
@@ -533,7 +549,7 @@ def chat(
         run(ReplConfig(
             url=srv.url, api_key=srv.api_key, n_ctx=n_ctx, model_spec=lm.spec, profile=profile_for(sh),
             thinking=thinking, show_thinking=show_thinking, system=system, max_tokens=max_tokens,
-            sampling_overrides=overrides, attachments=list(file), vision=has_vision,
+            sampling_overrides=overrides, attachments=list(file), vision=has_vision, video_frames=video_frames,
             save=save, resume=resumed, passphrase=passphrase,
             tools=tool_registry, tools_confirm=tools_confirm, searx=searx, auto_approve=auto_approve,
             shell_dir=(shell_dir if shell_dir is not None else Path.cwd()).expanduser().resolve(),

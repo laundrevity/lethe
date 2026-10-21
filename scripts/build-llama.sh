@@ -12,6 +12,7 @@
 #   GGML_ACCELERATE=ON          Apple Accelerate for the CPU-side BLAS bits
 #   GGML_NATIVE=ON              -mcpu=native for this exact chip
 #   LLAMA_CURL=OFF              we download with huggingface_hub, not llama-server
+#   MTMD_VIDEO=OFF              native FFmpeg cache: writes temp files; lethe decodes frames in RAM
 #   CMAKE_BUILD_RPATH=@loader_path  relative rpath so the build survives moving/renaming the repo
 set -euo pipefail
 
@@ -96,6 +97,7 @@ cmake -S "$SRC" -B "$BUILD" \
   -DLLAMA_OPENSSL=OFF \
   -DLLAMA_BUILD_UI=OFF \
   -DLLAMA_USE_PREBUILT_UI=OFF \
+  -DMTMD_VIDEO=OFF \
   -DLLAMA_BUILD_TESTS=OFF \
   -DLLAMA_BUILD_EXAMPLES=OFF \
   -DLLAMA_BUILD_TOOLS=ON \

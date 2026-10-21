@@ -67,7 +67,7 @@ _DEFAULT = Profile(
 )
 
 _BY_ARCH = {
-    "qwen3": _QWEN3, "qwen3moe": _QWEN3, "qwen3next": _QWEN3, "qwen35": _QWEN3, "qwen35moe": _QWEN3, "qwen3vl": _QWEN3, "qwen3vlmoe": _QWEN3,
+    "qwen3": _QWEN3, "qwen3moe": _QWEN3, "qwen3next": _QWEN3, "qwen35": _QWEN3, "qwen35moe": _QWEN3, "qwen3vl": _QWEN3, "qwen3vlmoe": _QWEN3, "qwen4exp": _QWEN3,
     "gemma3": _GEMMA, "gemma3n": _GEMMA, "gemma4": _GEMMA,
     "minimax-m2": _MINIMAX, "minimaxm2": _MINIMAX,
     "deepseek2": _DEEPSEEK, "deepseek3": _DEEPSEEK,

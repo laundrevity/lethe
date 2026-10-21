@@ -26,7 +26,7 @@ NEW="$(git rev-parse --short "$TARGET")"
 echo "[bump] $OLD -> $NEW ($(git log -1 --format=%cd --date=short "$TARGET"))"
 echo "[bump] $(git rev-list --count "$OLD".."$TARGET" 2>/dev/null || echo '?') upstream commits"
 
-if [ -n "$PATCH_FILE" ]; then
+if [ -f "$PATCH_FILE" ]; then
   # can the patch apply on the new base?
   git checkout -q --detach "$TARGET"
   if ! git apply --check "$PATCH_FILE" 2>/dev/null; then
