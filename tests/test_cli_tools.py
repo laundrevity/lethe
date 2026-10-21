@@ -7,19 +7,19 @@ from lethe import cli, repl, tools
 from lethe.shell import SandboxUnavailable, ShellMode
 
 
-def test_shell_directory_requires_explicit_opt_in(tmp_path):
-    result = CliRunner().invoke(cli.app, ["chat", "--shell-dir", str(tmp_path)])
+def test_shell_directory_requires_enabled_shell(tmp_path):
+    result = CliRunner().invoke(cli.app, ["chat", "--no-tools", "--shell-dir", str(tmp_path)])
     assert result.exit_code == 1
     assert "--shell-dir requires --tools or --shell" in result.output
 
 
-@pytest.mark.parametrize("flags", [[], ["--web"], ["--tools", "web"]])
-def test_full_mode_requires_shell_enabled(monkeypatch, flags):
+@pytest.mark.parametrize("flags", [["--web"], ["--shell"], ["--tools", "web"]])
+def test_no_tools_rejects_conflicting_flags(monkeypatch, flags):
     monkeypatch.setattr(cli, "_start", lambda *a, **kw: pytest.fail("model started"))
     monkeypatch.setattr(tools, "build_registry", lambda *a, **kw: pytest.fail("tools built"))
-    result = CliRunner().invoke(cli.app, ["chat", *flags, "--shell-mode", "full"])
-    assert result.exit_code == 1
-    assert "--shell-mode full requires --tools or --shell" in result.output
+    result = CliRunner().invoke(cli.app, ["chat", "--no-tools", *flags])
+    assert result.exit_code == 2
+    assert "--no-tools cannot be combined" in result.output
 
 
 def test_invalid_shell_mode_fails_before_starting(monkeypatch):
@@ -33,7 +33,7 @@ def test_sandbox_failure_prevents_server_launch(monkeypatch, tmp_path):
         raise SandboxUnavailable("sandbox unavailable")
     monkeypatch.setattr(tools, "build_registry", unavailable)
     monkeypatch.setattr(cli, "_start", lambda *a, **kw: pytest.fail("model started"))
-    result = CliRunner().invoke(cli.app, ["chat", "--shell", "--shell-dir", str(tmp_path)])
+    result = CliRunner().invoke(cli.app, ["chat", "--shell", "--shell-mode", "read-only", "--shell-dir", str(tmp_path)])
     assert result.exit_code == 1 and "sandbox unavailable" in result.output
 
 
@@ -56,8 +56,7 @@ def test_shell_and_web_flags_compose(monkeypatch, tmp_path, mode):
     configs = []
     monkeypatch.setattr(repl, "run", configs.append)
     args = ["--tools", "--web", "--shell-dir", str(tmp_path)]
-    if mode == ShellMode.FULL:
-        args += ["--shell-mode", "full"]
+    args += ["--shell-mode", mode.value]
     result = CliRunner().invoke(cli.app, cli._normalize_argv(args))
     assert result.exit_code == 0, result.exception
     assert captured == [(["shell", "web"], {"shell_dir": tmp_path, "shell_mode": mode})]
@@ -129,3 +128,27 @@ def test_resume_only_reads_unless_saving_is_asked_for(monkeypatch, tmp_path, fla
     assert result.exit_code == 0, result.output
     assert configs[0].resume is conv and configs[0].passphrase == "pw"
     assert configs[0].save is expect_save
+
+
+@pytest.mark.parametrize("flags,enabled", [([], True), (["--no-tools"], False)])
+def test_default_full_tools_and_opt_out(monkeypatch, tmp_path, flags, enabled):
+    from lethe.tools import VACUUM_CLAIM
+
+    monkeypatch.setattr(cli, "_start", lambda *a, **kw: FakeSession())
+    monkeypatch.setattr(cli.server, "props", lambda *a: {"default_generation_settings": {"n_ctx": 4096}})
+    monkeypatch.setattr(cli, "_resolve_or_offer", lambda *a: SimpleNamespace(path=tmp_path / "model.gguf", spec="model", size=1))
+    monkeypatch.setattr(cli, "_shape", lambda p: SimpleNamespace(arch="generic", name="test"))
+    monkeypatch.setattr(cli, "_default_system", lambda *a: "This conversation happens in a vacuum: inference is on-device, and nothing is " + VACUUM_CLAIM + tools.PRIVACY_NOTE)
+    configs = []
+    monkeypatch.setattr(repl, "run", configs.append)
+    result = CliRunner().invoke(cli.app, cli._normalize_argv(["model", "--no-instructions", *flags]))
+    assert result.exit_code == 0, result.exception
+    cfg = configs[0]
+    assert cfg.auto_approve is None
+    if enabled:
+        assert set(cfg.tools) == {"run_shell", "read_file", "write_file", "edit_file"}
+        assert VACUUM_CLAIM not in cfg.system
+        assert tools.FULL_SHELL_NOTE in cfg.system
+    else:
+        assert not cfg.tools
+        assert VACUUM_CLAIM in cfg.system

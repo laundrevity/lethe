@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import os
 import platform
 import re
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
+
+import psutil
 
 GiB = 1024**3
 
@@ -18,7 +22,7 @@ def _sysctl(name: str) -> str | None:
         return None
 
 
-def _metal_device_bytes() -> int | None:
+def _gpu_device_memory() -> tuple[int, int] | None:
     """Parse `llama-server --list-devices`: 'MTL0: Apple M5 Max (110100 MiB, 110099 MiB free)'."""
     from .paths import llama_bin
 
@@ -29,8 +33,13 @@ def _metal_device_bytes() -> int | None:
         out = subprocess.run([str(exe), "--list-devices"], capture_output=True, text=True, timeout=15)
     except Exception:
         return None
-    m = re.search(r"MTL\d+: .*?\((\d+) MiB", out.stdout + out.stderr)
-    return int(m.group(1)) * 1024 * 1024 if m else None
+    m = re.search(r"(?:MTL|Vulkan|ROCm|HIP|CUDA)\d+: .*?\((\d+) MiB, (\d+) MiB free\)", out.stdout + out.stderr)
+    return (int(m.group(1)) * 1024**2, int(m.group(2)) * 1024**2) if m else None
+
+
+def _metal_device_bytes() -> int | None:
+    memory = _gpu_device_memory()
+    return memory[0] if memory else None
 
 
 @dataclass
@@ -76,6 +85,7 @@ class Machine:
     ncpu: int
     chip: str
     is_apple_silicon: bool
+    gpu_free: int | None = None
 
     @property
     def usable_for_model(self) -> int:
@@ -85,11 +95,31 @@ class Machine:
     def available_now(self, excluding_rss: int = 0) -> int:
         """What is free *right now*: capacity minus what's already wired by everything else.
         `excluding_rss` = memory of our own server that is about to be stopped."""
+        if platform.system() == "Linux":
+            # Both host RAM and the GPU allocation budget constrain UMA. Do not
+            # subtract resident memory twice from the driver's free budget.
+            available = max(0, psutil.virtual_memory().available + excluding_rss - 4 * GiB)
+            gpu = self.gpu_wired_limit if self.gpu_free is None else self.gpu_free + excluding_rss
+            return min(self.usable_for_model, available, max(0, gpu - 4 * GiB))
         committed = max(0, wired_bytes() - excluding_rss)
         return max(0, self.usable_for_model - committed)
 
 
 def machine() -> Machine:
+    if platform.system() == "Linux":
+        total = psutil.virtual_memory().total
+        chip = platform.processor() or "unknown"
+        try:
+            for line in Path("/proc/cpuinfo").read_text().splitlines():
+                if line.startswith("model name"):
+                    chip = line.split(":", 1)[1].strip()
+                    break
+        except OSError:
+            pass
+        memory = _gpu_device_memory()
+        # No detected GPU means no verified GPU budget, not all host RAM.
+        limit, free = memory if memory else (0, 0)
+        return Machine(total, min(total, limit), os.cpu_count() or 1, chip, False, free)
     total = int(_sysctl("hw.memsize") or 0)
     ncpu = int(_sysctl("hw.ncpu") or 1)
     chip = _sysctl("machdep.cpu.brand_string") or platform.processor() or "unknown"

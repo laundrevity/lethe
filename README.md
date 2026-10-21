@@ -1,6 +1,6 @@
 # lethe
 
-Run GGUF models from Hugging Face locally on Apple Silicon with a Metal-built `llama.cpp` —
+Run GGUF models from Hugging Face locally on Apple Silicon (Metal) or Linux (Vulkan/ROCm) with `llama.cpp` —
 **logless and traceless by default**, and always knowing your **throughput** and **context window**.
 
 ```
@@ -24,7 +24,9 @@ prompt 9,912 tok @ 655 tok/s · gen 212 tok @ 33.4 tok/s · mtp accept 52% (140/
 
 ## Logless by default
 
-The point of running locally is that the conversation exists nowhere but in your head and, briefly, in RAM.
+Lethe keeps conversations in RAM unless you explicitly save them. Full-access shell and file tools
+are enabled by default: approved commands may write files, send data, and leave their own logs.
+Use `lethe --no-tools` for a session without model tools.
 So the defaults are:
 
 | surface | default | notes |
@@ -36,10 +38,10 @@ So the defaults are:
 | API access | **per-launch random key** (`--api-key`), on a free loopback port | other local software — including a web page doing `fetch("http://localhost:…")` — can't use the model |
 | prompt/KV cache to disk (`--slot-save-path`) | never set | KV lives in GPU-wired memory only |
 | model process | **lives only as long as the chat** | `lethe` starts `llama-server` when it starts and kills it when it exits, however it exits; there is no daemon, no pid file, nothing holding 30 GB between chats |
-| network | `127.0.0.1` only | |
+| model server network | `127.0.0.1` only | approved full-shell commands can use the network |
 | `chat` REPL | writes nothing; no history file (Up-arrow recall is in-memory only) | `/wipe` clears the conversation **and** the terminal scrollback |
 | terminal notifications | bell + a fixed phrase ("lethe: reply finished", "lethe: a tool call needs your approval") | Notification Center keeps notification text around, so no conversation content ever goes into one |
-| shell tool | **off**; `chat --tools [--shell-dir PATH]` opts in | read-only/offline macOS sandbox by default; `--shell-mode full` allows writes, network, and your inherited environment. Both modes confirm every command; Lethe keeps command text and captured output in memory unless you save the conversation |
+| shell and file tools | **on, full access** (equivalent to `--tools --shell-mode full`) | commands and file operations require approval; writes show a diff. `--no-tools` disables tools; `--shell-mode read-only` selects the offline macOS sandbox. Full mode allows writes, network, and inherited environment; command side effects can persist |
 | saved conversations | **off**; `chat --save` / `/save` opt in **per invocation** — `--resume ID` only reads | AES-256-GCM, key from your passphrase via scrypt, passphrase never stored; random filenames, title/model inside the ciphertext; `lethe conversations` lists ids only (`--unlock` to see titles), `--delete` overwrites then removes |
 | clipboard | only on explicit `/copy` | clipboard managers and Universal Clipboard can persist or forward that, so it's never automatic |
 | Hugging Face | telemetry disabled; downloads anonymous unless the repo is gated | what you download is still visible to HF, as with any download |
@@ -79,7 +81,7 @@ approximate token cost; they are only read, never written, and are re-read on `-
 with the conversation). `--no-instructions` skips them, as does `--no-system`; `--system TEXT` keeps them. A
 project file is part of the system prompt, so read an unfamiliar repository's `AGENTS.md` before chatting inside it.
 
-**Internet tools and full-access shell mode are opt-in exceptions to "nothing leaves the machine".** `chat --tools web,fetch`
+**Full-access shell tools are enabled by default; dedicated web search/fetch tools remain opt-in.** `chat --tools web,fetch`
 gives the model `web_search` (keyless ddgs metasearch over Google/Brave/Bing/Mojeek/…, or your own
 SearXNG via `--searx URL`) and `fetch_url` (page → markdown via trafilatura); `/web` in the REPL turns
 them on mid-conversation and `/web off` withdraws them (the default system prompt is patched to match). The model composes the
@@ -94,8 +96,10 @@ write files or logs; Lethe's in-memory conversation handling does not prevent th
 ## Command-line tool
 
 ```bash
-uv run lethe --tools                         # shell tool, reading the current directory
-uv run lethe --tools --shell-dir ./src       # let the model inspect this directory instead
+uv run lethe                                # full shell + file tools, with approvals
+uv run lethe --no-tools                     # no model tools
+uv run lethe --shell-mode read-only         # offline macOS sandbox
+uv run lethe --shell-dir ./src              # start shell commands in this directory
 uv run lethe --web --tools                   # internet tools + shell
 uv run lethe --web --tools --shell-mode full  # internet tools + full-access shell
 uv run lethe --tools web,fetch,shell         # or name tools explicitly (--shell is the same as bare --tools)
@@ -146,7 +150,7 @@ when needed. Typing the command grants access; shell executions still ask for ap
 Tool descriptions and the built-in system prompt update immediately. A failed mode change leaves
 the existing tools and directory unchanged.
 
-`--shell-mode read-only` is the default. `--shell-mode full` selects a separate runner without
+`--shell-mode full` is the default and selects a separate runner without
 Lethe's sandbox, running as your current user. Full mode enables file edits, builds, installs, and
 network access (including localhost) using your inherited PATH, environment, credentials, proxies,
 and tool configuration. It works with Homebrew tools and virtual environments on that PATH.
@@ -157,8 +161,8 @@ shell are not loaded. Both modes still require confirmation for every command.
 
 For example, `uv run lethe --tools --shell-mode full --shell-dir ~/dev/my-project` enables full
 shell access starting in that project. Add `--web` for the dedicated search/fetch tools; shell
-networking in full mode works independently of `--web`. At launch, `--shell-mode` requires
-`--tools` or `--shell`. In chat, use `/shell full`, `/shell read-only`, or `/tools full` to change
+networking in full mode works independently of `--web`. `--tools web,fetch` selects only dedicated
+web tools; `--no-tools` disables all tools at launch. In chat, use `/shell full`, `/shell read-only`, or `/tools full` to change
 access without restarting. The model can ask for access; you grant it with a chat command.
 A sandbox failure never switches modes automatically.
 
@@ -219,7 +223,9 @@ command in the read-only sandbox, checks the final answer, and does not save the
 
 ## Setup
 
-Requires Apple Silicon macOS, Xcode Command Line Tools, CMake, and `uv`.
+Requires CMake, a C++ compiler, and `uv`. On Apple Silicon macOS, install Xcode Command Line Tools.
+On Linux, Vulkan needs the Vulkan development files, `glslc`, and SPIRV-Headers; ROCm needs HIP,
+hipBLAS, and rocBLAS (the Strix Halo target is `gfx1151`).
 Model files, local configuration, and encrypted conversations are kept out of Git;
 set the default model and download it on each machine.
 
@@ -228,11 +234,38 @@ git clone --recurse-submodules https://github.com/laundrevity/lethe.git
 cd lethe
 uv sync
 uv run lethe pull HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF:Q8_K_P
-scripts/build-llama.sh           # Metal + Accelerate, Release; applies the downloaded FastMTP patch
-uv run lethe doctor              # confirms Metal is linked and reports the GPU memory budget
+scripts/build-llama.sh           # Metal on macOS, ROCm on Linux; applies scripts/fastmtp.patch
+uv run lethe doctor              # checks the selected GPU backend and memory budget
 uv run lethe default HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF:Q8_K_P
 uv run lethe                     # loads the model, chats, then unloads it on exit
 ```
+
+Linux backend comparison (same upstream source and FastMTP patch):
+
+```bash
+scripts/build-llama.sh --backend=vulkan
+scripts/build-llama.sh --backend=hip
+LETHE_BACKEND=vulkan uv run lethe bench --server --ctx 262144 -d 0,32768
+LETHE_BACKEND=hip uv run lethe bench --server --ctx 262144 -d 0,32768
+LETHE_BACKEND=vulkan uv run lethe  # select Vulkan for this invocation
+```
+
+Linux defaults to ROCm/HIP; macOS defaults to Metal. The builds stay in separate directories.
+`AMDGPU_TARGETS` overrides the HIP architecture; `JOBS` limits build parallelism.
+The build also searches `.deps/` for optional project-local development dependencies.
+If SPIRV-Headers is unavailable from the system package manager, it can be installed locally:
+
+```bash
+git clone https://github.com/KhronosGroup/SPIRV-Headers.git /tmp/lethe-spirv-headers
+cmake -S /tmp/lethe-spirv-headers -B /tmp/lethe-spirv-headers/build -DCMAKE_INSTALL_PREFIX="$PWD/.deps"
+cmake --install /tmp/lethe-spirv-headers/build
+```
+
+Read-only shell tools still require macOS Seatbelt and fail closed on Linux; full shell mode
+is the default, with approval for every command unless you opt into auto-approval.
+
+The upstream pin is `620d2225c` (2026-10-15), with the rebased FastMTP patch in
+`scripts/fastmtp.patch`. `scripts/bump-llama.sh` checks that patch before moving to a newer pin.
 
 For an existing clone, run `git submodule update --init` before building.
 The `improvements` branch is also published; use `git switch improvements` to check it out.
@@ -260,7 +293,7 @@ from the GGUF's architecture, following each model card's recommendations; overr
 | `lethe bench [spec] [-d 0,32768]` | `llama-bench` prompt/gen speeds at context depth — **no speculative decoding, this is the floor** |
 | `lethe bench [spec] --server [-d 0,32768]` | through `llama-server`: no-MTP vs embedded MTP vs FastMTP, real tok/s and acceptance |
 | `lethe traces [--delete]` | list/remove anything written to disk beyond model files |
-| `lethe doctor` | Metal build, memory budget, what's in use, what's on disk |
+| `lethe doctor` | GPU build, memory budget, what's in use, what's on disk |
 
 In the REPL: `/file PATH` and `/image PATH` (with `--vision`) attach to the next message; `/compact`
 summarizes the conversation with the model and continues from the summary; `/think on|off`; `/copy`;
@@ -281,8 +314,42 @@ With the model file in the OS cache that costs about three seconds per launch.
 The header of each GGUF is read directly (only the first ~16 MiB, over HTTP for remote files), so hybrid
 models such as Qwen3.5/3.8 (Gated DeltaNet + 1-in-4 attention layers) are costed correctly — their long
 context is far cheaper than a dense model of the same size. Capacity is what Metal reports as
-`recommendedMaxWorkingSetSize` minus 4 GiB of headroom; "free now" subtracts memory already wired by
+`recommendedMaxWorkingSetSize` minus 4 GiB of headroom; on Linux, the selected backend’s
+reported GPU limit/free memory is capped by available host RAM and reserves 4 GiB. On macOS, "free now" subtracts memory already wired by
 other processes (e.g. another llama-server). Real usage adds 1–3 GiB of compute buffers.
+
+## Reference numbers — Ryzen AI Max+ 395, 128 GB, Qwen3.8-27B Q8_K_P
+
+Measured 2026-10-15 on Radeon 8060S (`gfx1151`), Linux 7.2.8, Mesa/RADV 26.2.4,
+ROCm packages 7.2.4, upstream `620d2225c` plus `scripts/fastmtp.patch`.
+Both backends successfully allocate 262,144 context with F16 KV and generate with FastMTP
+and thinking enabled. The model + draft + KV estimate is 46.1 GiB, excluding compute buffers.
+
+Server benchmarks below allocate the full 262,144 context, with initially empty context,
+greedy sampling, thinking off, and 256-token replies over the same prose/reasoning/code prompts.
+Generation rates aggregate tokens divided by generation time; prefill is an uncached 2,669-token prompt.
+
+| Backend | No MTP gen | Embedded MTP d3 gen | FastMTP d3 gen | FastMTP prefill | FastMTP acceptance |
+|---|---:|---:|---:|---:|---:|
+| ROCm/HIP | 7.2 tok/s | 15.8 tok/s | 18.3 tok/s | 359 tok/s | 62% |
+| Vulkan/RADV | 7.3 tok/s | 15.7 tok/s | 17.9 tok/s | 355 tok/s | 62% |
+
+With the same repeated-text prefix targeting 32K (actual prefill **42,605 tokens**),
+FastMTP d3 measured:
+
+| Backend | Long prefill | Generation after prefix | Acceptance |
+|---|---:|---:|---:|
+| ROCm/HIP | 288.6 tok/s | 16.29 tok/s | 62% |
+| Vulkan/RADV | 268.3 tok/s | 15.81 tok/s | 64% |
+
+ROCm was about 2–3% faster at FastMTP generation and 8% faster at the long prefill in this run.
+The small generation difference is not a robust backend ranking; this is one suite per backend.
+ROCm/HIP is the Linux default based on these measurements; bare `lethe` uses it.
+Select Vulkan for a particular invocation with `LETHE_BACKEND=vulkan lethe`.
+The full 262K context was allocated, but these throughput tests did not fill all 262K tokens.
+Actual thinking-chat throughput varies with the prompt and draft acceptance.
+The separate ROCm `llama-bench` baseline (3 repetitions) was pp2048 379.4 ± 0.7 tok/s,
+tg128 7.21 ± 0.01 tok/s. No system power or memory-limit settings were changed for these tests.
 
 ## Reference numbers — M5 Max, 128 GB, Qwen3.8-27B Q8_K_P
 

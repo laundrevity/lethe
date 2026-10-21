@@ -1,7 +1,7 @@
 # lethe
 
-Local LLM runner for Apple Silicon: a vendored, Metal-built `llama.cpp` driven by a small Python CLI.
-Target machine: M5 Max, 128 GB unified memory, 40 GPU cores, macOS 26. See README.md for usage.
+Local LLM runner for Apple Silicon (Metal) and Linux Strix Halo (Vulkan/ROCm): vendored `llama.cpp` driven by a small Python CLI.
+Target machines: M5 Max, 128 GB unified memory, 40 GPU cores, macOS 26; Ryzen AI Max+ 395, Radeon 8060S (gfx1151), 128 GB UMA, Linux. See README.md for usage.
 
 ## Prime directive: logless and traceless by default
 
@@ -21,13 +21,15 @@ model's inputs and outputs. Every feature must preserve that:
   is typed, which continue the same id with the same passphrase), AES-256-GCM with a scrypt-derived key, passphrase held in memory
   only, random filenames, all metadata inside the ciphertext, plaintext never written (not even a temp
   file), delete = overwrite then unlink. `lethe.toml` holds configuration only (default model).
-- Model tools (`tools.py`, `shell.py`, `files.py`) are opt-in per invocation (`--web`/`--tools`/`--shell`, `/web`). Web tools are
-  the one way anything leaves the machine: every request is printed first, nothing is cached, fetches are guarded
-  against private addresses and pinned with `curl --resolve`. The shell is read-only, offline Seatbelt
-  (`sandbox-exec`), always asks y/n, and has no unsandboxed fallback — never add one. The only unsandboxed shell is the
-  explicit opt-in `--shell-mode full` / `/shell full` / `/tools full` (a separate `FullShell` runner that runs as the
+- Shell and file tools (`shell.py`, `files.py`) are enabled by default in full mode, per the user's
+  explicit preference (equivalent to `--tools --shell-mode full`). `--no-tools` disables all model tools;
+  `--tools web,fetch` selects web tools only. Dedicated web tools remain opt-in (`--web`, `/web`).
+  Web requests are printed first, nothing is cached, fetches are guarded against private addresses
+  and pinned with `curl --resolve`. Approved full-shell commands can also send data or persist files.
+  `--shell-mode read-only` selects offline Seatbelt (`sandbox-exec`), always asks y/n, and has no
+  unsandboxed fallback — never add one. Full mode is a separate `FullShell` runner that runs as the
   user, with writes, network and inherited environment; still confirms every command; a sandbox failure never
-  switches to it). The shell brings file tools with it (`files.py`): `read_file` in both modes (workspace-confined
+  switches to it. The shell brings file tools with it (`files.py`): `read_file` in both modes (workspace-confined
   when read-only), `write_file`/`edit_file` (exact-string replace) in full mode only — never in read-only. They always
   ask y/n, writes are approved as a diff, and they keep no backups/temp files. The prompt (`repl.ask_approval`) also
   takes `p`: the call is NOT run and the user's note goes back to the model as the tool result — never execute on `p`.
@@ -49,8 +51,9 @@ model's inputs and outputs. Every feature must preserve that:
   by hand (e.g. port 8090); never touch them.
 - Hugging Face: `HF_HUB_DISABLE_TELEMETRY=1` (set in `hub.py` before import); downloads are anonymous
   unless the repo is gated (then falls back to `HF_TOKEN`).
-- Before adding any dependency or feature, ask: does it write, phone home, or cache content? If yes,
-  it's opt-in and documented in README "Logless by default".
+- Before adding any dependency or feature, ask: does it write, phone home, or cache content? Apart from
+  the user-requested default full-shell/file tools (which require call approval), such behavior must be
+  opt-in and documented in README "Logless by default".
 
 ## Architecture (decisions, not descriptions)
 
@@ -59,18 +62,21 @@ model's inputs and outputs. Every feature must preserve that:
   reasoning flags, or hybrid-attention models. The Python side talks to `llama-server` over HTTP
   (`/v1/chat/completions` streaming; the final chunk's `timings` gives prompt/gen tok/s and
   `draft_n`/`draft_n_accepted`; `/props` gives `n_ctx`).
-- **Submodule pin = upstream master `1729ed5` (2026-08-25) + one local commit** on branch
-  `lethe-fastmtp` applying `models/**/HauhauCS-FastMTP-llama.cpp.patch` (a `d2t` draft-vocab trim in
+- **Submodule pin = upstream master `620d2225c` (2026-10-15) + one local commit** on branch
+  `lethe-fastmtp` applying the rebased `scripts/fastmtp.patch` (a `d2t` draft-vocab trim in
   `src/models/qwen35.cpp`). The build script applies/commits the patch automatically. Bumping upstream
-  means re-running `git apply --check` on that patch; `qwen35.cpp` is the only file it touches.
+  means re-running `git apply --check` on that patch (rebased for upstream `nextn_flags`); `qwen35.cpp` is the only file it touches.
 - **Build flags are canonical in `scripts/build-llama.sh`.** Metal + Accelerate explicitly ON, Metal
   shader library embedded, `GGML_NATIVE`, Release, curl OFF, `CMAKE_BUILD_RPATH=@loader_path` (without it
   the binaries carry an absolute rpath and break when the repo is moved/renamed — exit -6 from dyld).
   Targets: `llama-server llama-cli llama-bench` (there is no `llama-gguf` target). `lethe doctor` verifies
-  Metal is linked and lists devices.
+  GPU memory is reported and lists devices. Linux uses separate `build-vulkan` and `build-hip` directories;
+  `LETHE_BACKEND=vulkan|hip` selects runtime binaries (default ROCm/HIP on Linux, Metal on macOS).
+  HIP targets `gfx1151` by default (`AMDGPU_TARGETS` overrides it). Both Linux backends use `$ORIGIN` rpaths.
+  UI asset downloads and OpenSSL are disabled; model downloads remain in `hub.py`.
 - **Models live in `./models/<owner>--<repo>/`**, downloaded via `huggingface_hub` (`hf` CLI is part of
   that package), not the shared `~/.cache/huggingface` — files are 10–60 GB and we want them explicit.
-  `models/` is gitignored. `HF_TOKEN` is set in the user's shell.
+  `models/` is gitignored. `HF_TOKEN` is optional for public models and read only from the environment.
 - **Models are identified as `owner/repo:QUANT`** (`spec.py`); local files are grouped by shard and
   mapped back to that form from `models/<owner>--<repo>/`. Sampler/thinking defaults come from
   `profiles.py`, keyed on GGUF architecture — add a profile there when adding a model family, don't
@@ -93,7 +99,9 @@ model's inputs and outputs. Every feature must preserve that:
   that fits. KV math lives in `ggufmeta.py` (own ~100-line GGUF header parser; reads only the first
   16 MiB, works over HTTP Range for remote files — never downloads a model to inspect it).
 - **Memory budget** = Metal's `recommendedMaxWorkingSetSize` as reported by `llama-server --list-devices`
-  (107.5 GiB on this machine — higher than the 75%-of-RAM folk rule) minus 4 GiB headroom.
+  (107.5 GiB on the Mac — higher than the 75%-of-RAM folk rule) minus 4 GiB headroom. On Linux,
+  use the selected GPU backend’s reported limit/free memory, capped by available host RAM, minus 4 GiB;
+  no detected GPU means no verified budget. Do not assume all UMA is GPU-allocatable.
 - Python is managed with **`uv`** (`uv run lethe ...`, `uv add ...`). Python 3.12, src layout, typer + rich.
 
 ## Apple Silicon notes

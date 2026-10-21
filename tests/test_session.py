@@ -103,3 +103,10 @@ def test_a_terminated_lethe_takes_its_server_with_it(tmp_path):
             break
         time.sleep(0.25)
     assert not alive(child_pid)
+
+
+def test_no_mmap_uses_upstream_load_mode():
+    cfg = server.ServeConfig(model=Path("model.gguf"), n_ctx=8192, no_mmap=True)
+    args = cfg.argv()
+    assert args[args.index("--load-mode") + 1] == "none"
+    assert "--no-mmap" not in args

@@ -1,7 +1,7 @@
 [project]
 name = "lethe"
 version = "0.1.0"
-description = "Logless, traceless local LLM runner for Apple Silicon (llama.cpp + Metal)"
+description = "Logless, traceless local LLM runner (llama.cpp + Metal, Vulkan, or ROCm)"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

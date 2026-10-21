@@ -5,16 +5,22 @@
 #   scripts/bump-llama.sh <commit>     # bump to a specific upstream commit
 #
 # The superproject records the *upstream* commit as the submodule pin; the patch lives as one extra
-# commit on the local branch `lethe-fastmtp` (see CLAUDE.md). This script keeps that arrangement.
+# commit on the local branch `lethe-fastmtp` (see AGENTS.md). This script keeps that arrangement.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC="$ROOT/vendor/llama.cpp"
 PATCH_FILE="$(ls "$ROOT"/models/*/HauhauCS-FastMTP-llama.cpp.patch 2>/dev/null | head -1 || true)"
+[ ! -f "$ROOT/scripts/fastmtp.patch" ] || PATCH_FILE="$ROOT/scripts/fastmtp.patch"
 TARGET="${1:-origin/master}"
 
 cd "$SRC"
-OLD="$(git rev-parse --short HEAD)"
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+  echo "[bump] submodule has local changes; commit or stash them first" >&2
+  exit 1
+fi
+OLD="$(git rev-parse HEAD)"
+OLD_BRANCH="$(git symbolic-ref --short -q HEAD || true)"
 git fetch -q origin master
 NEW="$(git rev-parse --short "$TARGET")"
 echo "[bump] $OLD -> $NEW ($(git log -1 --format=%cd --date=short "$TARGET"))"
@@ -22,12 +28,10 @@ echo "[bump] $(git rev-list --count "$OLD".."$TARGET" 2>/dev/null || echo '?') u
 
 if [ -n "$PATCH_FILE" ]; then
   # can the patch apply on the new base?
-  if git diff --quiet "$TARGET" -- src/models/qwen35.cpp 2>/dev/null; then :; fi
-  git stash -q 2>/dev/null || true
   git checkout -q --detach "$TARGET"
   if ! git apply --check "$PATCH_FILE" 2>/dev/null; then
     echo "[bump] FastMTP patch does NOT apply on $NEW — staying on $OLD" >&2
-    git checkout -q lethe-fastmtp
+    git checkout -q "${OLD_BRANCH:-$OLD}"
     exit 1
   fi
   git checkout -q -B lethe-fastmtp "$TARGET"
@@ -46,4 +50,4 @@ echo "[bump] superproject pin staged: $(git -C "$SRC" rev-parse --short "$TARGET
 "$ROOT/scripts/build-llama.sh"
 uv run lethe doctor
 echo
-echo "[bump] done. Update the pin note in CLAUDE.md and commit: git commit -m 'Bump llama.cpp to $NEW'"
+echo "[bump] done. Update the pin note in AGENTS.md and commit: git commit -m 'Bump llama.cpp to $NEW'"

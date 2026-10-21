@@ -105,7 +105,8 @@ def _in_use_line() -> None:
     procs = [p for p in llama_processes() if p.rss > 256 * 1024 * 1024]
     if procs:
         bits = [f"pid {p.pid} {fmt_bytes(p.rss)} ({Path(p.cmd.split()[0]).parent.parent.parent.name})" for p in procs]
-        con.print(f"[dim]in use now: {', '.join(bits)} · wired total {fmt_bytes(wired_bytes())}[/]")
+        suffix = f" · wired total {fmt_bytes(wired_bytes())}" if sys.platform == "darwin" else " (process RSS; GPU allocations may be additional)"
+        con.print(f"[dim]in use now: {', '.join(bits)}{suffix}[/]")
 
 
 def _resolve_or_offer(model: str, yes: bool = False) -> S.LocalModel:
@@ -241,10 +242,11 @@ def _start(
 
 @app.command()
 def doctor():
-    """Verify the Metal build, memory limits, and that nothing is on disk that shouldn't be."""
+    """Verify the GPU build, memory limits, and that nothing is on disk that shouldn't be."""
     m = machine()
     con.print(f"[bold]{m.chip}[/] — {m.ncpu} CPU cores, RAM {fmt_bytes(m.total_ram)}")
-    con.print(f"GPU-wired limit: {fmt_bytes(m.gpu_wired_limit)} (raise with: sudo sysctl iogpu.wired_limit_mb=<MB>)")
+    hint = " (raise with: sudo sysctl iogpu.wired_limit_mb=<MB>)" if m.is_apple_silicon else ""
+    con.print(f"GPU memory limit: {fmt_bytes(m.gpu_wired_limit)}{hint}")
     con.print(f"Model+KV budget: {fmt_bytes(m.usable_for_model)} · free now {fmt_bytes(m.available_now())}")
     _in_use_line()
     ok = True
@@ -262,10 +264,12 @@ def doctor():
         if out.returncode != 0:
             con.print("[red]✗[/] llama-server does not run (moved repo? rebuild: scripts/build-llama.sh --clean)")
             ok = False
-        if llama_bin("libggml-metal.dylib").exists():
+        if m.is_apple_silicon and llama_bin("libggml-metal.dylib").exists():
             con.print("[green]✓[/] Metal backend linked (libggml-metal)")
+        elif not m.is_apple_silicon and m.gpu_wired_limit > 0:
+            con.print("[green]✓[/] GPU backend reports usable memory")
         else:
-            con.print("[red]✗[/] Metal backend NOT linked — rebuild with scripts/build-llama.sh")
+            con.print("[red]✗[/] No GPU memory detected — check drivers and selected backend")
             ok = False
         dev = subprocess.run([str(llama_bin("llama-server")), "--list-devices"], capture_output=True, text=True)
         txt = (dev.stdout + dev.stderr).strip()
@@ -427,10 +431,11 @@ def chat(
     min_p: Optional[float] = typer.Option(None, help="Override min_p"),
     no_system: bool = typer.Option(False, "--no-system", help="No system prompt at all (default: a short one grounding the model: local, private, this hardware)"),
     web: bool = typer.Option(False, "--web", help="Shorthand for --tools web,fetch: let the model search the web and read pages"),
-    tools: Optional[str] = typer.Option(None, "--tools", help="OPT-IN model tools. Bare --tools = shell (read-only/offline unless --shell-mode full); or name them: web,fetch,shell. Composes with --web"),
-    shell: bool = typer.Option(False, "--shell", help="Enable the shell tool (read-only/offline unless --shell-mode full); always asks before running commands"),
+    tools: Optional[str] = typer.Option("shell", "--tools", help="Model tools (default: shell and file tools). Bare --tools = shell; or name them: web,fetch,shell. Composes with --web"),
+    no_tools: bool = typer.Option(False, "--no-tools", help="Disable all model tools for this invocation"),
+    shell: bool = typer.Option(False, "--shell", help="Enable the shell tool (enabled by default); commands require approval unless --auto-approve all"),
     shell_dir: Optional[Path] = typer.Option(None, "--shell-dir", help="Shell workspace or, in full mode, starting directory (default: current directory); requires --shell or --tools shell"),
-    shell_mode: ShellMode = typer.Option(ShellMode.READ_ONLY, "--shell-mode", help="read-only: offline macOS sandbox. full: run as you, with writes, network, inherited PATH/environment and credentials; requires --tools or --shell"),
+    shell_mode: ShellMode = typer.Option(ShellMode.FULL, "--shell-mode", help="full (default): run as you, with writes, network, inherited PATH/environment and credentials. read-only: offline macOS sandbox"),
     searx: Optional[str] = typer.Option(None, "--searx", help="Back web search with this SearXNG instance URL instead of the ddgs metasearch"),
     no_instructions: bool = typer.Option(False, "--no-instructions", help="Do not load LETHE.md instruction files (global: the lethe repo's LETHE.md; project: nearest LETHE.md or AGENTS.md from the launch directory up)"),
     tools_confirm: bool = typer.Option(False, "--tools-confirm", help="Ask y/n before every tool call (shell commands always ask)"),
@@ -446,16 +451,15 @@ def chat(
         if not f.is_file():
             err.print(f"[red]no such file: {f}[/]")
             raise typer.Exit(1)
-    tool_names = [t.strip() for t in (tools or "").split(",") if t.strip()]
+    if no_tools and (web or shell or tools not in (None, "shell")):
+        raise typer.BadParameter("--no-tools cannot be combined with tool-enabling options")
+    tool_names = [] if no_tools else [t.strip() for t in (tools or "").split(",") if t.strip()]
     if web:
         tool_names.append("web")
     if shell:
         tool_names.append("shell")
     if shell_dir is not None and "shell" not in tool_names:
         err.print("--shell-dir requires --tools or --shell", style="red")
-        raise typer.Exit(1)
-    if shell_mode == ShellMode.FULL and "shell" not in tool_names:
-        err.print("--shell-mode full requires --tools or --shell", style="red")
         raise typer.Exit(1)
     if auto_approve is not None and auto_approve not in T.AUTO_APPROVE_SCOPES:
         err.print("--auto-approve takes files or all", style="red")
@@ -466,7 +470,10 @@ def chat(
     tool_registry: dict = {}
     if tool_names:
         try:
-            tool_registry = T.build_registry(tool_names, searx=searx, shell_dir=shell_dir, shell_mode=shell_mode)
+            tool_registry = T.build_registry(
+                tool_names, searx=searx, shell_dir=shell_dir,
+                shell_mode=shell_mode if "shell" in tool_names else ShellMode.READ_ONLY,
+            )
         except KeyError as e:
             err.print(f"unknown tool {e} — available: web, fetch, shell", style="red", markup=False)
             raise typer.Exit(1)
@@ -580,6 +587,7 @@ def bench(
     depth: str = typer.Option("0", "-d", help="Context depths to test at, e.g. 0,32768"),
     kv: str = typer.Option("f16", help="KV cache type"),
     server_mode: bool = typer.Option(False, "--server", help="Benchmark through llama-server instead: measures real MTP/FastMTP speed and acceptance"),
+    ctx: int = typer.Option(0, min=0, help="Server benchmark context allocation (0: largest depth + 8192)"),
     extra: list[str] = typer.Option([], "--arg", help="Extra llama-bench args"),
 ):
     """Throughput benchmark. Default: llama-bench (no speculative decoding = the floor). --server: with MTP."""
@@ -592,7 +600,9 @@ def bench(
     if server_mode:
         from .benchserver import run_server_bench
 
-        run_server_bench(lm, depths=depths, kv=kv, launch=_start)
+        if ctx and ctx < max(depths) + 8192:
+            raise typer.BadParameter("--ctx must be at least the largest depth + 8192")
+        run_server_bench(lm, depths=depths, kv=kv, launch=_start, ctx=ctx)
         return
     argv = [
         str(llama_bin("llama-bench")), "-m", str(lm.path), "-ngl", "99", "-fa", "1",

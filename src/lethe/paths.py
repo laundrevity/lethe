@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 
@@ -31,7 +32,11 @@ def llama_dir() -> Path:
 
 
 def llama_bin(name: str) -> Path:
-    return llama_dir() / "build" / "bin" / name
+    backend = os.environ.get("LETHE_BACKEND", "metal" if sys.platform == "darwin" else "hip")
+    if backend not in {"metal", "vulkan", "hip"}:
+        raise ValueError(f"Unknown LETHE_BACKEND: {backend}; choose metal, vulkan, or hip")
+    build = "build" if backend == "metal" else f"build-{backend}"
+    return llama_dir() / build / "bin" / name
 
 
 def repo_dirname(repo_id: str) -> str:

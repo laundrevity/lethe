@@ -45,12 +45,15 @@ def _filler_of_tokens(url: str, api_key: str | None, n: int) -> str:
     return text
 
 
-def run_server_bench(lm: S.LocalModel, *, depths: list[int], kv: str, launch) -> None:
+def run_server_bench(lm: S.LocalModel, *, depths: list[int], kv: str, launch, ctx: int = 0) -> None:
     has_draft = any("fastmtp" in p.name.lower() for p in lm.path.parent.glob("*.gguf"))
     configs = [("no MTP", dict(mtp=False, draft=False)), ("embedded MTP d3", dict(mtp=True, draft=False))]
     if has_draft:
         configs.append(("FastMTP d3", dict(mtp=True, draft=True)))
-    ctx = max(depths) + 8192
+    minimum_ctx = max(depths) + 8192
+    if ctx and ctx < minimum_ctx:
+        raise ValueError(f"benchmark context must be at least {minimum_ctx} for these depths")
+    ctx = ctx or minimum_ctx
     rows: list[Row] = []
     con.print(f"[bold]server benchmark[/] {lm.spec} · configs: {', '.join(c for c, _ in configs)} · depths {depths} · greedy, thinking off, 256 tokens")
     for name, opts in configs:

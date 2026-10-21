@@ -1,4 +1,4 @@
-"""Opt-in tools for the model (README "Logless by default").
+"""Model tools (README "Logless by default").
 
 Nothing here runs unless tools are enabled. Internet tools send model-composed
 queries and URLs off-machine. Shell commands use the selected execution mode;

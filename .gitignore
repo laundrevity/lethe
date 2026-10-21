@@ -23,3 +23,6 @@ lethe.toml
 /ROGUE-SWARM-HUNT.md
 /tragedy.md
 /BUG-tool-call-limit-final-answer.md
+
+# Optional local build dependencies
+.deps/

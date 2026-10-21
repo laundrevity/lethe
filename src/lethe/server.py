@@ -74,7 +74,7 @@ class ServeConfig:
         if self.api_key:
             a += ["--api-key", self.api_key]
         if self.no_mmap:
-            a.append("--no-mmap")
+            a += ["--load-mode", "none"]
         if self.mtp:
             a += ["--spec-type", "draft-mtp", "--spec-draft-n-max", str(self.draft_n_max), "--spec-draft-p-min", "0"]
             if self.draft:
