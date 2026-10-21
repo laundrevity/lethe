@@ -38,6 +38,10 @@ model's inputs and outputs. Every feature must preserve that:
   a `lethe.toml` setting). The default system prompt's "nothing leaves this machine" claim is patched by
   `tools.sync_system_text` to match what is enabled.
 - **Media attachments** (`attachments.py`, `video.py`) are explicit (`--vision` plus `/image`, `/video`, or `-f`).
+  `--vision` also enables `view_image(path)` automatically unless `--no-tools` is set. It uses the same
+  in-memory image loader and file path rules (workspace-confined in read-only mode); approval is required
+  unless `--auto-approve files|all` is given. `/tools off` disables it; `/shell off` leaves it available.
+  Tool replies may contain image parts; never stringify, truncate, or print their base64 payloads.
   Video uses local FFmpeg/ffprobe to sample timestamped PNG frames through stdout pipes only (no audio,
   network protocols, FFREPORT, cache protocol, or extracted files). The server receives images, never
   `input_video`; native video decoding is disabled at build time to prevent its disk-backed cache.

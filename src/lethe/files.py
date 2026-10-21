@@ -1,7 +1,8 @@
-"""Opt-in file tools that ride along with the shell tool: read, write, exact-string edit.
+"""File tools: read, write, exact-string edit, and opt-in image inspection.
 
 read_file exists in both shell modes (confined to the workspace when read-only);
-write_file and edit_file exist only in full-access mode. Every call asks y/n, and
+write_file and edit_file exist only in full-access mode. --vision adds view_image
+using the same path rules and the in-memory attachment loader. Every call asks y/n, and
 writes show a diff first. Content goes only into the conversation and the file the
 user approved: no backups, temp files, or edit history.
 """
@@ -129,6 +130,20 @@ class FileTools:
         if n <= len(lines):
             out.append(f"[lines {offset}-{n - 1} of {len(lines)}; call read_file with offset={n} to continue]")
         return "\n".join(out)
+
+    def view_image(self, path: str) -> list[dict]:
+        """Return the same image parts used by /image, without writing or caching them."""
+        from .attachments import image_data_url, is_image
+
+        p = self._resolve(path)
+        if not p.is_file():
+            raise ValueError(f"not a regular file: {self._show(p)}")
+        if not is_image(p):
+            raise ValueError("unsupported image extension; use PNG, JPEG, GIF, BMP, or WebP")
+        return [
+            {"type": "text", "text": f"Image: {self._show(p)}"},
+            {"type": "image_url", "image_url": {"url": image_data_url(p)}},
+        ]
 
     def _planned_write(self, path: str, content: str) -> tuple[Path, str | None]:
         p = self._resolve(path)

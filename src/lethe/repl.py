@@ -280,8 +280,13 @@ def _print_tool_call(name: str, arguments: str) -> None:
     con.print("⚙ " + T.describe_call(name, arguments, full=True), style="cyan", markup=False, highlight=False)
 
 
-def _print_tool_result(result: str) -> None:
-    con.print(f"[dim]  → {len(result):,} chars[/]")
+def _print_tool_result(result: str | list[dict]) -> None:
+    if isinstance(result, str):
+        con.print(f"[dim]  → {len(result):,} chars[/]")
+    else:
+        chars = sum(len(p.get("text", "")) for p in result if p.get("type") == "text")
+        images = sum(p.get("type") == "image_url" for p in result)
+        con.print(f"[dim]  → {chars:,} chars · {images} image(s)[/]")
 
 
 def _replay_history(messages: list[dict], *, show_thinking: bool) -> None:
@@ -336,6 +341,8 @@ def _enable_shell(cfg: ReplConfig, mode: T.ShellMode, directory: Path | None = N
     registry = T.build_registry(
         ["shell", "web"] if web else ["shell"], searx=cfg.searx, shell_dir=root, shell_mode=mode,
     )
+    if cfg.vision:
+        registry["view_image"] = T.build_image_tool(root, confined=mode != T.ShellMode.FULL)
     for name in T.SHELL_TOOL_NAMES:  # a switch to read-only must drop write_file/edit_file
         cfg.tools.pop(name, None)
     cfg.tools.update(registry)
@@ -396,7 +403,7 @@ def _tool_command(cmd: str, arg: str, messages: list[dict], cfg: ReplConfig) -> 
     con.print(_approval_line(cfg), style="red" if cfg.auto_approve else "dim")
 
 
-def _invoke_tool(cfg: ReplConfig, name: str, arguments: str) -> str:
+def _invoke_tool(cfg: ReplConfig, name: str, arguments: str) -> str | list[dict]:
     tool = cfg.tools.get(name)
     if tool is None:
         return f"unknown or disabled tool {name}"

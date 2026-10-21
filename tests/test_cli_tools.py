@@ -131,24 +131,47 @@ def test_resume_only_reads_unless_saving_is_asked_for(monkeypatch, tmp_path, fla
 
 
 @pytest.mark.parametrize("flags,enabled", [([], True), (["--no-tools"], False)])
-def test_default_full_tools_and_opt_out(monkeypatch, tmp_path, flags, enabled):
+@pytest.mark.parametrize("vision", [False, True])
+def test_default_full_tools_and_opt_out(monkeypatch, tmp_path, flags, enabled, vision):
     from lethe.tools import VACUUM_CLAIM
 
     monkeypatch.setattr(cli, "_start", lambda *a, **kw: FakeSession())
-    monkeypatch.setattr(cli.server, "props", lambda *a: {"default_generation_settings": {"n_ctx": 4096}})
+    monkeypatch.setattr(cli.server, "props", lambda *a: {"default_generation_settings": {"n_ctx": 4096}, "modalities": {"vision": vision}})
     monkeypatch.setattr(cli, "_resolve_or_offer", lambda *a: SimpleNamespace(path=tmp_path / "model.gguf", spec="model", size=1))
     monkeypatch.setattr(cli, "_shape", lambda p: SimpleNamespace(arch="generic", name="test"))
     monkeypatch.setattr(cli, "_default_system", lambda *a: "This conversation happens in a vacuum: inference is on-device, and nothing is " + VACUUM_CLAIM + tools.PRIVACY_NOTE)
     configs = []
     monkeypatch.setattr(repl, "run", configs.append)
-    result = CliRunner().invoke(cli.app, cli._normalize_argv(["model", "--no-instructions", *flags]))
+    result = CliRunner().invoke(cli.app, cli._normalize_argv(["model", "--no-instructions", *flags, *(["--vision"] if vision else [])]))
     assert result.exit_code == 0, result.exception
     cfg = configs[0]
     assert cfg.auto_approve is None
     if enabled:
-        assert set(cfg.tools) == {"run_shell", "read_file", "write_file", "edit_file"}
+        assert set(cfg.tools) == {"run_shell", "read_file", "write_file", "edit_file"} | ({"view_image"} if vision else set())
         assert VACUUM_CLAIM not in cfg.system
         assert tools.FULL_SHELL_NOTE in cfg.system
+        assert (tools.IMAGE_TOOL_NOTE in cfg.system) is vision
     else:
         assert not cfg.tools
         assert VACUUM_CLAIM in cfg.system
+
+
+@pytest.mark.parametrize("has_vision", [False, True])
+@pytest.mark.parametrize("selection", ["web,fetch", ""])
+def test_vision_image_tool_does_not_require_shell_and_checks_server_capability(monkeypatch, tmp_path, has_vision, selection):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "_start", lambda *a, **kw: FakeSession())
+    monkeypatch.setattr(cli.server, "props", lambda *a: {"modalities": {"vision": has_vision}})
+    monkeypatch.setattr(cli, "_resolve_or_offer", lambda *a: SimpleNamespace(path=tmp_path / "model.gguf", spec="model", size=1))
+    monkeypatch.setattr(cli, "_shape", lambda p: SimpleNamespace(arch="generic", name="test"))
+    configs = []
+    monkeypatch.setattr(repl, "run", configs.append)
+    result = CliRunner().invoke(cli.app, ["chat", "model", "--no-system", "--vision", "--tools", selection])
+    assert result.exit_code == 0, result.exception
+    cfg = configs[0]
+    expected = {"web_search", "fetch_url"} if selection else set()
+    assert set(cfg.tools) == expected | ({"view_image"} if has_vision else set())
+    if has_vision:
+        photo = tmp_path / "photo.png"
+        photo.write_bytes(b"synthetic PNG")
+        assert cfg.tools["view_image"].fn("photo.png")[1]["type"] == "image_url"
