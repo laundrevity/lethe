@@ -1,4 +1,4 @@
 [submodule "vendor/llama.cpp"]
 	path = vendor/llama.cpp
 	url = https://github.com/laundrevity/llama.cpp.git
-	ignore = all
+	ignore = none
