@@ -1,4 +1,4 @@
-- show output of tool calls
-- stream tool calls as they arrive (rather than waiting for giant command to sudden appear on screen for approval)
-- include flags that were launched when showing resume command after /save (and/or just make --web and shell tools etc default on)
-- notify when requiring tool response in terminal tab (like codex / claude code)
+- [ ] show output of tool calls
+- [x] stream tool calls as they arrive (rather than waiting for giant command to sudden appear on screen for approval)
+- [x] include flags that were launched when showing resume command after /save (and/or just make --web and shell tools etc default on)
+- [ ] notify when requiring tool response in terminal tab (like codex / claude code)

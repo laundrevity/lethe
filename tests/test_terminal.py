@@ -3,6 +3,7 @@
 import io
 import os
 
+import pytest
 from rich.console import Console
 
 from lethe import repl, terminal
@@ -86,6 +87,51 @@ def test_status_line_is_inert_without_a_terminal_or_room(monkeypatch):
     with terminal.StatusLine(out) as status:
         status.update("anything", force=True)
     assert out.getvalue() == "" and not status.active
+
+
+def test_tool_stream_renders_split_names_and_arguments_without_waiting():
+    out = io.StringIO()
+    status = terminal.StatusLine(out)
+    out.write("Assistant text")
+    status.wrote("Assistant text")
+    with terminal.ToolCallStream(status) as stream:
+        stream.feed([{"index": 0, "function": {"name": "run_"}}])
+        assert out.getvalue() == "Assistant text\n⚙ tool call 1 (streaming): run_"
+        stream.feed([{"index": 0, "function": {"name": "shell", "arguments": '{"command":"head'}}])
+        assert out.getvalue().endswith('run_shell\n{"command":"head')
+        stream.feed([{"index": 0, "function": {"arguments": ' tail"}'}}])
+        assert out.getvalue().endswith('{"command":"head tail"}')
+    assert out.getvalue().endswith('tail"}\n') and status.col == 0
+
+
+def test_tool_stream_labels_interleaved_calls_and_escapes_controls_on_abort():
+    out = io.StringIO()
+    status = terminal.StatusLine(out)
+    with pytest.raises(KeyboardInterrupt), terminal.ToolCallStream(status) as stream:
+        stream.feed([{"index": 1, "function": {"name": "run_shell", "arguments": "first\x1b"}}])
+        stream.feed([{"index": 0, "function": {"name": "read_file", "arguments": "second"}}])
+        stream.feed([{"index": 1, "function": {"arguments": "[2J\r\u202e[bold]tail"}}])
+        raise KeyboardInterrupt
+    shown = out.getvalue()
+    assert shown == (
+        "⚙ tool call 2 (streaming): run_shell\nfirst\\x1b\n"
+        "⚙ tool call 1 (streaming): read_file\nsecond\n"
+        "⚙ tool call 2 (streaming): run_shell\n[2J\\x0d\\u202e[bold]tail\n"
+    )
+    assert status.col == 0
+
+
+def test_tool_stream_tracks_wrapping_for_status_redraws(monkeypatch):
+    monkeypatch.setattr(terminal.os, "get_terminal_size", lambda fd: os.terminal_size((80, 24)))
+    out = FakeTTY()
+    with terminal.StatusLine(out) as status, terminal.ToolCallStream(status) as stream:
+        stream.feed([{"function": {"name": "write_file", "arguments": "x" * 80}}])
+        before = out.getvalue()
+        status.update("tool call", force=True)
+        assert status.at_margin and out.getvalue() == before
+        stream.feed([{"function": {"arguments": "y"}}])
+        status.update("tool call", force=True)
+        assert not status.at_margin and "\x1b[24;1H" in out.getvalue()[len(before):]
 
 
 def test_notify_rings_the_bell_and_sends_no_content(monkeypatch):

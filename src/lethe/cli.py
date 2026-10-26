@@ -34,6 +34,32 @@ MODEL_HELP = "Model: owner/repo:QUANT (canonical), a .gguf path, or a unique sub
 # ----------------------------------------------------------------------------- helpers
 
 
+def _resume_args(context: typer.Context) -> list[str]:
+    """Keep explicit launch options for the terminal hint, never in config or the vault.
+
+    Saved messages already contain the system prompt and attachments. Saving and downloads require
+    a fresh opt-in; the resume id is supplied separately. Use parsed values so aliases, enums and
+    negative boolean flags round-trip without copying raw argv or exposing prompt text.
+    """
+    omitted = {"system", "file", "save", "resume", "yes"}
+    args = []
+    for param in context.command.params:
+        source = context.get_parameter_source(param.name)
+        if param.name in omitted or source is None or source.name != "COMMANDLINE":
+            continue
+        value = context.params[param.name]
+        if param.name == "model":
+            args.append(str(value))
+        elif isinstance(value, bool):
+            flags = param.opts if value else param.secondary_opts
+            args.extend(flags[:1])
+        else:
+            if param.name == "shell_dir":
+                value = Path(value).expanduser().resolve()
+            args.extend([param.opts[0], str(getattr(value, "value", value))])
+    return args
+
+
 def _default_system(lm: S.LocalModel, shape: ModelShape, net_tools: bool = False) -> str:
     """Ground the model in its actual situation: what it is, whose machine this is, and that nobody is listening."""
     m = machine()
@@ -428,6 +454,7 @@ def default(model: Optional[str] = typer.Argument(None, help=MODEL_HELP + " — 
 
 @app.command()
 def chat(
+    cli_context: typer.Context,
     model: Optional[str] = typer.Argument(None, help=MODEL_HELP + " (default: lethe.toml)"),
     ctx: int = typer.Option(0, "--ctx", "-c", help="Context tokens (0 = native max if it fits)"),
     kv: str = typer.Option("f16", help="KV cache type: f16|q8_0|q4_0"),
@@ -557,6 +584,7 @@ def chat(
             save=save, resume=resumed, passphrase=passphrase,
             tools=tool_registry, tools_confirm=tools_confirm, searx=searx, auto_approve=auto_approve,
             shell_dir=(shell_dir if shell_dir is not None else Path.cwd()).expanduser().resolve(),
+            resume_args=_resume_args(cli_context),
         ))
 
 

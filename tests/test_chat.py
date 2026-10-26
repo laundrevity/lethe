@@ -26,15 +26,41 @@ def call_chunks(finish="tool_calls"):
 def test_stream_assembles_complete_tool_calls(monkeypatch):
     install_stream(monkeypatch, call_chunks())
     events = list(chat.stream_chat("http://localhost", [], n_ctx=100))
-    assert events[0].tool_calls == [{"id": "abc", "type": "function", "function": {"name": "run_shell", "arguments": '{"command":"ls"}'}}]
+    assert events[0].tool_call_deltas == call_chunks()[0]["choices"][0]["delta"]["tool_calls"]
+    assert events[1].tool_call_deltas == call_chunks()[1]["choices"][0]["delta"]["tool_calls"]
+    assert events[0].tool_calls is None and events[1].tool_calls is None
+    assert events[2].tool_calls == [{"id": "abc", "type": "function", "function": {"name": "run_shell", "arguments": '{"command":"ls"}'}}]
     assert events[-1].finish_reason == "tool_calls"
 
 
 @pytest.mark.parametrize("finish,done", [("tool_calls", False), ("length", True), (None, True)])
-def test_incomplete_tool_calls_are_never_emitted(monkeypatch, finish, done):
+def test_incomplete_tool_calls_only_emit_display_fragments(monkeypatch, finish, done):
     install_stream(monkeypatch, call_chunks(finish), done)
+    events = []
     with pytest.raises(RuntimeError, match="incomplete tool-call response"):
-        list(chat.stream_chat("http://localhost", [], n_ctx=100))
+        for event in chat.stream_chat("http://localhost", [], n_ctx=100):
+            events.append(event)
+    assert len(events) == 2 and all(e.tool_calls is None and e.tool_call_deltas for e in events)
+
+
+def test_interleaved_tool_fragments_keep_their_indices_and_assemble_in_order(monkeypatch):
+    fragments = [
+        [{"index": 1, "id": "second", "function": {"name": "read_", "arguments": '{"path":'}}],
+        [{"index": 0, "id": "first", "function": {"name": "run_", "arguments": '{"command":'}}],
+        [{"index": 1, "function": {"name": "file", "arguments": '"README.md"}'}}],
+        [{"index": 0, "function": {"name": "shell", "arguments": '"pwd"}'}}],
+    ]
+    chunks = [{"choices": [{"delta": {"tool_calls": f, "content": "Working." if i == 0 else ""}}],
+               "timings": {"predicted_n": i + 1}} for i, f in enumerate(fragments)]
+    install_stream(monkeypatch, chunks + [{"choices": [{"delta": {}, "finish_reason": "stop"}]}])
+    events = list(chat.stream_chat("http://localhost", [], n_ctx=100))
+    assert [e.tool_call_deltas for e in events[:4]] == fragments
+    assert events[0].content == "Working."
+    assert [e.timings["predicted_n"] for e in events[:4]] == [1, 2, 3, 4]
+    assert events[-2].tool_calls == [
+        {"id": "first", "type": "function", "function": {"name": "run_shell", "arguments": '{"command":"pwd"}'}},
+        {"id": "second", "type": "function", "function": {"name": "read_file", "arguments": '{"path":"README.md"}'}},
+    ]
 
 
 def test_stream_reports_prompt_progress_and_running_timings(monkeypatch):

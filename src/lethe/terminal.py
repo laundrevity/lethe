@@ -14,6 +14,71 @@ from typing import TextIO
 
 APPLE_TERMINAL = "Apple_Terminal"
 
+_DISPLAY_ESCAPES = {
+    code: f"\\x{code:02x}" for code in [*range(32), *range(127, 160)] if code not in (9, 10)
+}
+_DISPLAY_ESCAPES.update({code: f"\\u{code:04x}" for code in [*range(0x202A, 0x202F), *range(0x2066, 0x206A)]})
+
+
+def terminal_safe(text: str) -> str:
+    """Escape terminal controls per chunk, including split sequences, without changing model context."""
+    return text.translate(_DISPLAY_ESCAPES)
+
+
+class ToolCallStream:
+    """Append tool names and raw JSON arguments as they arrive, labeled by call index.
+
+    This is a preview only; the complete call or file diff is still shown before approval. Keeping
+    fragments verbatim avoids interpreting unfinished JSON. Interleaved calls get a fresh label
+    whenever the index changes; previously printed arguments are never repeated or buffered here.
+    """
+
+    def __init__(self, status: StatusLine):
+        self.status = status
+        self.out = status.out
+        self.names: dict[int, str] = {}
+        self.index: int | None = None
+        self.in_arguments = False
+
+    def __enter__(self) -> ToolCallStream:
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.finish()
+
+    def _write(self, text: str) -> None:
+        text = terminal_safe(text)
+        self.out.write(text)
+        self.status.wrote(text)
+
+    def feed(self, fragments: list[dict]) -> None:
+        for fragment in fragments:
+            index = fragment.get("index", 0)
+            function = fragment.get("function") or {}
+            name, arguments = function.get("name") or "", function.get("arguments") or ""
+            self.names[index] = self.names.get(index, "") + name
+            if index != self.index or (name and self.in_arguments):
+                self.finish()
+                if self.status.col:
+                    self._write("\n")
+                self.index = index
+                self._write(f"⚙ tool call {index + 1} (streaming): {self.names[index]}")
+            elif name:
+                self._write(name)
+            if arguments:
+                if not self.in_arguments:
+                    self._write("\n")
+                    self.in_arguments = True
+                self._write(arguments)
+        self.out.flush()
+
+    def finish(self) -> None:
+        if self.index is not None:
+            if self.status.col:
+                self._write("\n")
+            self.index, self.in_arguments = None, False
+            self.out.flush()
+
 
 def _is_tty(out: TextIO) -> bool:
     try:

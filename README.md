@@ -59,6 +59,11 @@ Saved conversations include the model's thinking, tool calls and tool results in
 never writes: the file stays as it was unless you also pass `--save`, or type `/save` during the chat — both
 keep saving to the same id with the passphrase you unlocked it with, and the exit line says when a session's
 new turns were not kept.
+The resume command printed by `/save` and on exit carries the explicit launch options (including web/tool
+selection, shell mode/directory, vision, sampling, and approval settings), with shell-quoted values. These
+options stay in RAM; they are not saved as defaults or added to the vault. The hint omits `--save` and `--yes`,
+and does not reattach `-f` files or repeat `--system` text: those inputs are already in the saved conversation.
+Mid-chat tool/thinking changes do not change the launch options in the hint.
 `--no-show-thinking` hides thinking in both replay and live output without removing it from saved messages.
 Older saves can replay their tool calls and any thinking they retained, but thinking discarded by earlier
 versions cannot be recovered. Replaying a call never executes it again.
@@ -113,6 +118,10 @@ of a verdict: `p use ninja instead`, or `p` and then the note on the next line. 
 gets the note as the call's result and may ask again. The terminal bell rings while a call waits for you.
 `--yes` only affects model downloads; shell approval is always required. `/shell` shows the scope;
 `/shell off` removes the tool. `/web off` only removes internet tools.
+
+Tool names and JSON arguments stream to the terminal as the model produces them, so long commands and file
+edits are visible before generation finishes. This is only a preview: approval still shows the complete call
+or file diff, and incomplete or interrupted calls never execute.
 
 The shell brings file tools with it, so the model does not have to build files out of `cat` heredocs and `sed`:
 

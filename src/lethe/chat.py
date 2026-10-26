@@ -83,6 +83,7 @@ class Delta:
     tool_calls: list[dict] | None = None  # complete accumulated calls, yielded once at stream end
     timings: dict | None = None  # server timings so far (cache_n, prompt_n, predicted_n, …), with every chunk
     progress: dict | None = None  # prompt processing so far: total, cache, processed (tokens), time_ms
+    tool_call_deltas: list[dict] | None = None  # incremental fragments for display only, never execution
 
 
 def stream_chat(
@@ -96,10 +97,11 @@ def stream_chat(
     api_key: str | None = None,
     tools: list[dict] | None = None,
 ) -> Iterator[Delta | TurnStats]:
-    """Yield Delta chunks (a final one may carry tool_calls), then a final TurnStats.
+    """Yield Delta chunks (including tool_call_deltas), then complete tool_calls and TurnStats.
 
     Every chunk asks for the server's running timings and prompt-processing progress, so the caller
-    can show context use and speed while the reply is still being produced.
+    can show context use and speed while the reply is still being produced. Only the final tool_calls
+    are executable: fragments may be incomplete, and a truncated stream must never run a tool.
     """
     body: dict = {"messages": messages, "stream": True, "timings_per_token": True, "return_progress": True}
     if sampling:
@@ -145,12 +147,13 @@ def stream_chat(
                         f = tc.get("function") or {}
                         slot["function"]["name"] += f.get("name") or ""
                         slot["function"]["arguments"] += f.get("arguments") or ""
-                    if d.get("content") or d.get("reasoning_content"):
+                    if d.get("content") or d.get("reasoning_content") or d.get("tool_calls"):
                         yield Delta(content=d.get("content") or "", reasoning=d.get("reasoning_content") or "",
+                                    tool_call_deltas=d.get("tool_calls") or None,
                                     timings=chunk_timings, progress=progress)
                         emitted = True
                 if (chunk_timings or progress) and not emitted:
-                    yield Delta(timings=chunk_timings, progress=progress)  # progress only: tool-call text, prompt processing
+                    yield Delta(timings=chunk_timings, progress=progress)
     if calls:
         if not done or finish not in {"tool_calls", "stop"}:
             raise RuntimeError("incomplete tool-call response; no tools were executed")

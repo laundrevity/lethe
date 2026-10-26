@@ -16,7 +16,7 @@ from . import tools as T, vault
 from .attachments import UnsupportedFile, approx_tokens, file_block, image_data_url, is_image, is_video
 from .chat import Delta, TurnStats, complete, stream_chat
 from .profiles import Profile, describe
-from .terminal import StatusLine, notify
+from .terminal import StatusLine, ToolCallStream, notify, terminal_safe as _terminal_safe
 
 con = Console()
 #MAX_TOOL_ROUNDS = 8
@@ -25,20 +25,6 @@ con = Console()
 # TODO: add option to disable tool call limits via CLI e.g. lethe.toml
 MAX_TOOL_ROUNDS = 10**9
 MAX_TOOL_CALLS = 10**9
-
-_DISPLAY_ESCAPES = {
-    code: f"\\x{code:02x}" for code in [*range(32), *range(127, 160)] if code not in (9, 10)
-}
-_DISPLAY_ESCAPES.update({code: f"\\u{code:04x}" for code in [*range(0x202A, 0x202F), *range(0x2066, 0x206A)]})
-
-
-def _terminal_safe(text: str) -> str:
-    """Keep model/file text from controlling the terminal around approval prompts.
-
-    Applied per chunk, so even split escape sequences stay inert. The original
-    text remains in the conversation; only its terminal presentation is escaped.
-    """
-    return text.translate(_DISPLAY_ESCAPES)
 
 HELP = """\
 /quit          leave (Ctrl-D too)
@@ -100,6 +86,10 @@ class ReplConfig:
     searx: str | None = None  # so /web can build the registry mid-session with the launch-time backend
     shell_dir: Path = field(default_factory=Path.cwd)  # remembered across mode changes and /shell off
     auto_approve: str | None = None  # --auto-approve files|all; calls are still printed, just not asked about
+    resume_args: list[str] = field(default_factory=list)  # launch options for the printed hint; RAM only
+
+    def resume_command(self, conversation_id: str) -> str:
+        return shlex.join(["lethe", "--resume", conversation_id, *self.resume_args])
 
 
 def key_sequences() -> dict:
@@ -618,7 +608,8 @@ def run(cfg: ReplConfig) -> None:
                     if passphrase:
                         saving = True
                         persist()
-                        con.print(f"[yellow]saving encrypted as {conv.id}[/] → resume with: lethe --resume {conv.id}")
+                        con.print(_terminal_safe(f"saving encrypted as {conv.id} → resume with: {cfg.resume_command(conv.id)}"),
+                                  style="yellow", markup=False, highlight=False, soft_wrap=True)
             elif cmd == "compact":
                 if not any(m["role"] == "user" for m in messages):
                     con.print("[dim]nothing to compact[/]")
@@ -682,7 +673,6 @@ def run(cfg: ReplConfig) -> None:
         # then the last turn's exact number (or a character-count guess) plus what has been added since.
         ctx_est = (last.ctx_used if last else _approx_messages(messages[:-1])) + _approx_messages(messages[-1:])
         progress: TurnStats | None = None
-        prompt_phase = "prompt"
         status = StatusLine()
 
         def show(phase: str, *, force: bool = False) -> None:
@@ -696,37 +686,46 @@ def run(cfg: ReplConfig) -> None:
         try:
             with status:
                 while True:
-                    round_text, round_reasoning, pending_calls, progress, prompt_phase = [], [], None, None, "prompt"
-                    show(prompt_phase, force=True)
-                    for ev in stream_chat(cfg.url, messages, n_ctx=cfg.n_ctx, sampling=sampling, max_tokens=cfg.max_tokens, chat_template_kwargs=kwargs, api_key=cfg.api_key, tools=tool_specs):
-                        if isinstance(ev, TurnStats):
-                            last = ev
-                            continue
-                        if ev.progress:
-                            prompt_phase = f"prompt {ev.progress.get('processed', 0):,}/{ev.progress.get('total', 0):,} tok"
-                        if ev.timings:
-                            progress = TurnStats.from_timings(ev.timings, cfg.n_ctx, None)
-                        if ev.tool_calls:
-                            pending_calls = ev.tool_calls
-                            continue
-                        if ev.reasoning:
-                            round_reasoning.append(ev.reasoning)
-                        if ev.reasoning and cfg.show_thinking:
-                            if not in_reasoning:
-                                sys.stdout.write("\x1b[2;3mthinking…\x1b[23m ")
-                                status.wrote("thinking… ")
-                                in_reasoning = True
-                            emit(_terminal_safe(ev.reasoning))
-                        if ev.content:
-                            if in_reasoning:
-                                sys.stdout.write("\x1b[0m")
-                                emit("\n")
-                                in_reasoning = False
-                            round_text.append(ev.content)
-                            emit(_terminal_safe(ev.content))
-                        sys.stdout.flush()
-                        show("thinking" if in_reasoning else "writing" if round_text
-                             else "tool call" if progress and progress.predicted_n else prompt_phase)
+                    round_text, round_reasoning, pending_calls, progress, phase = [], [], None, None, "prompt"
+                    show(phase, force=True)
+                    with ToolCallStream(status) as call_stream:
+                        for ev in stream_chat(cfg.url, messages, n_ctx=cfg.n_ctx, sampling=sampling, max_tokens=cfg.max_tokens, chat_template_kwargs=kwargs, api_key=cfg.api_key, tools=tool_specs):
+                            if isinstance(ev, TurnStats):
+                                last = ev
+                                continue
+                            if ev.progress:
+                                phase = f"prompt {ev.progress.get('processed', 0):,}/{ev.progress.get('total', 0):,} tok"
+                            if ev.timings:
+                                progress = TurnStats.from_timings(ev.timings, cfg.n_ctx, None)
+                            if ev.reasoning or ev.content:
+                                call_stream.finish()
+                            if ev.reasoning:
+                                phase = "thinking"
+                                round_reasoning.append(ev.reasoning)
+                            if ev.reasoning and cfg.show_thinking:
+                                if not in_reasoning:
+                                    sys.stdout.write("\x1b[2;3mthinking…\x1b[23m ")
+                                    status.wrote("thinking… ")
+                                    in_reasoning = True
+                                emit(_terminal_safe(ev.reasoning))
+                            if ev.content or ev.tool_call_deltas:
+                                if in_reasoning:
+                                    sys.stdout.write("\x1b[0m")
+                                    emit("\n")
+                                    in_reasoning = False
+                            if ev.content:
+                                phase = "writing"
+                                round_text.append(ev.content)
+                                emit(_terminal_safe(ev.content))
+                            if ev.tool_call_deltas:
+                                phase = "tool call"
+                                call_stream.feed(ev.tool_call_deltas)
+                            if ev.tool_calls:
+                                phase = "tool call"
+                                pending_calls = ev.tool_calls
+                                call_stream.finish()
+                            sys.stdout.flush()
+                            show(phase)
                     if in_reasoning:
                         sys.stdout.write("\x1b[0m")
                         emit("\n")
@@ -809,7 +808,8 @@ def run(cfg: ReplConfig) -> None:
         persist()
         con.print()
     if saving:
-        con.print(f"[dim]saved {conv.id} · resume with: lethe --resume {conv.id}[/]")
+        con.print(_terminal_safe(f"saved {conv.id} · resume with: {cfg.resume_command(conv.id)}"),
+                  style="dim", markup=False, highlight=False, soft_wrap=True)
     elif cfg.resume:
         new_turns = sum(1 for m in messages if m["role"] == "user") - conv.turns
         if new_turns > 0:
