@@ -5,6 +5,10 @@ __pycache__/
 *.egg-info/
 .lethe/
 lethe.toml
+.DS_Store
+/image.png
+/oo
+/oot
 
 # local scratch notes (session/conversation ids, launch one-liners)
 *.last

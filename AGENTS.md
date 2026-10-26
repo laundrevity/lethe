@@ -111,7 +111,7 @@ model's inputs and outputs. Every feature must preserve that:
   (107.5 GiB on the Mac — higher than the 75%-of-RAM folk rule) minus 4 GiB headroom. On Linux,
   use the selected GPU backend’s reported limit/free memory, capped by available host RAM, minus 4 GiB;
   no detected GPU means no verified budget. Do not assume all UMA is GPU-allocatable.
-- Python is managed with **`uv`** (`uv run lethe ...`, `uv add ...`). Python 3.12, src layout, typer + rich.
+- Python is managed with **`uv`** (`uv run lethe ...`, `uv add ...`). Python 3.15.1, src layout, typer + rich.
 
 ## Apple Silicon notes
 

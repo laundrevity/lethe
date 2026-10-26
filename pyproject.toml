@@ -3,7 +3,7 @@ name = "lethe"
 version = "0.1.0"
 description = "Logless, traceless local LLM runner (llama.cpp + Metal, Vulkan, or ROCm)"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.15.1"
 dependencies = [
     "cryptography>=50.0.0",
     "ddgs>=9.16.0",

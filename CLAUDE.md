@@ -99,7 +99,7 @@ model's inputs and outputs. Every feature must preserve that:
   16 MiB, works over HTTP Range for remote files — never downloads a model to inspect it).
 - **Memory budget** = Metal's `recommendedMaxWorkingSetSize` as reported by `llama-server --list-devices`
   (107.5 GiB on this machine — higher than the 75%-of-RAM folk rule) minus 4 GiB headroom.
-- Python is managed with **`uv`** (`uv run lethe ...`, `uv add ...`). Python 3.12, src layout, typer + rich.
+- Python is managed with **`uv`** (`uv run lethe ...`, `uv add ...`). Python 3.15.1, src layout, typer + rich.
 
 ## Apple Silicon notes
 
