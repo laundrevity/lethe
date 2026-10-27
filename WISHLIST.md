@@ -1,4 +1,6 @@
 - [ ] show output of tool calls
-- [x] stream tool calls as they arrive (rather than waiting for giant command to sudden appear on screen for approval)
-- [x] include flags that were launched when showing resume command after /save (and/or just make --web and shell tools etc default on)
 - [ ] notify when requiring tool response in terminal tab (like codex / claude code)
+- [ ] parallelize multiple web_search / fetch_url
+- [ ] remove wasted backslash tokens in run_shell e.g. with `python3 -c \"\nimport json\nd=json.load(open(\\\`...
+- [ ] remove duplicated tool call print (and have streaming text appear light blue, like tool call it becomes when streaming finishes)
+- [ ] create separate tool(s) for executing commands over ssh (instead of `⚙ 'run_shell'({"command": "ssh -o BatchMode=yes oswald 'python3 - <<\"EOF\"\nimport struct, json, os\nM=\"/` etc)
