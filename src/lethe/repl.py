@@ -42,7 +42,7 @@ HELP = """\
 /stats         last turn's throughput/context line
 /web [off]     enable internet tools mid-chat (search + page fetch; every request is printed) — or launch with --web
 /shell [full|read-only|off] [PATH]  show, enable, change, or disable shell access mid-chat
-               (brings read_file; full also brings write_file + edit_file, approved as diffs)
+               (brings read_file; full adds Python/Bash, SSH, and write_file + edit_file with diffs)
 /tools [full|off] [PATH]  show tools, enable web + full shell access, or disable all tools
 Tool approval: y runs the call · n declines · p sends the model a note instead of running it (p your note, or type it on the next line)
 Enter sends · Option+Enter, Ctrl+J, Shift+Enter, Ctrl+Enter or a trailing \\ add a line (Apple Terminal cannot tell Shift/Ctrl+Enter
@@ -333,7 +333,7 @@ def _enable_shell(cfg: ReplConfig, mode: T.ShellMode, directory: Path | None = N
     )
     if cfg.vision:
         registry["view_image"] = T.build_image_tool(root, confined=mode != T.ShellMode.FULL)
-    for name in T.SHELL_TOOL_NAMES:  # a switch to read-only must drop write_file/edit_file
+    for name in T.SHELL_TOOL_NAMES:  # read-only must drop SSH and file writes
         cfg.tools.pop(name, None)
     cfg.tools.update(registry)
     cfg.shell_dir = root
@@ -393,7 +393,10 @@ def _tool_command(cmd: str, arg: str, messages: list[dict], cfg: ReplConfig) -> 
     con.print(_approval_line(cfg), style="red" if cfg.auto_approve else "dim")
 
 
-def _invoke_tool(cfg: ReplConfig, name: str, arguments: str) -> str | list[dict]:
+def _prepare_tool(
+    cfg: ReplConfig, name: str, arguments: str, *, streamed_call: int | None = None,
+) -> tuple[T.Tool, dict] | str:
+    """Validate, display and approve on the main thread, without executing."""
     tool = cfg.tools.get(name)
     if tool is None:
         return f"unknown or disabled tool {name}"
@@ -401,21 +404,32 @@ def _invoke_tool(cfg: ReplConfig, name: str, arguments: str) -> str | list[dict]
         args = tool.parse_arguments(arguments)
     except (ValueError, TypeError) as e:
         return f"invalid tool arguments: {e}"
-    # Approval must cover the entire command. Escape control characters and turn
-    # off Rich markup so model text cannot hide or restyle what is being approved.
+    # A receipt from ToolCallStream means this exact call was already shown as
+    # one complete block. Keep approval tied to its number, without repeating it.
+    # Escape controls and disable Rich markup in every model-supplied field.
     if tool.confirmation_context:
-        con.print(tool.confirmation_context, style="dim", markup=False, highlight=False)
+        label = f"tool call {streamed_call} · " if streamed_call is not None else ""
+        con.print(label + tool.confirmation_context, style="dim", markup=False, highlight=False)
+    elif streamed_call is not None:
+        con.print(f"tool call {streamed_call} · " + _terminal_safe(name), style="cyan", markup=False, highlight=False)
     if tool.preview is not None:
-        # File changes are approved as a diff, not as a JSON blob of escaped newlines.
+        # File changes show a diff; code tools show literal source.
         try:
             header, _, body = tool.preview(**args).partition("\n")
         except Exception as e:  # noqa: BLE001 — e.g. old_string not found: tell the model, don't bother the user
             return f"error: {e}"
-        con.print("⚙ " + ascii(name) + " " + _terminal_safe(header), style="cyan", markup=False, highlight=False)
-        for line in body.split("\n"):
-            style = "green" if line.startswith("+") else "red" if line.startswith("-") else "dim"
-            con.print(_terminal_safe(line), style=style, markup=False, highlight=False, soft_wrap=True)
-    else:
+        # Streamed code needs validation, but no second preview. File
+        # diffs are new information and must still be shown.
+        if streamed_call is None or name not in T.CODE_TOOL_NAMES:
+            label = "⚙ " + ascii(name) + " " if streamed_call is None else "  "
+            con.print(label + _terminal_safe(header), style="cyan", markup=False, highlight=False)
+            is_diff = name in {"write_file", "edit_file"}
+            for line in body.split("\n"):
+                style = "cyan"
+                if is_diff:
+                    style = "green" if line.startswith("+") else "red" if line.startswith("-") else "dim"
+                con.print(_terminal_safe(line), style=style, markup=False, highlight=False, soft_wrap=True)
+    elif streamed_call is None:
         _print_tool_call(name, arguments)
     auto = cfg.auto_approve == "all" or (cfg.auto_approve == "files" and name in T.FILE_TOOL_NAMES)
     if (cfg.tools_confirm or tool.requires_confirmation) and not auto:
@@ -428,12 +442,65 @@ def _invoke_tool(cfg: ReplConfig, name: str, arguments: str) -> str | list[dict]
             return "the user declined this request"
         if decision is not True:
             return NOTE_RESULT.format(note=decision)
+    return tool, args
+
+
+def _invoke_tool(
+    cfg: ReplConfig, name: str, arguments: str, *, streamed_call: int | None = None,
+) -> str | list[dict]:
+    prepared = _prepare_tool(cfg, name, arguments, streamed_call=streamed_call)
+    if isinstance(prepared, str):
+        return prepared
+    tool, args = prepared
     try:
         return tool.fn(**args)
     except KeyboardInterrupt as e:
         raise ToolInterrupted from e
     except Exception as e:  # noqa: BLE001 — give the model the error, never bypass a failed sandbox
         return f"error: {e}"
+
+
+def _invoke_web_group(cfg, calls, call_stream, *, allowance, record_result, show_status):
+    """Approve in order, execute concurrently, then record in request order."""
+    from .webbatch import WebBatch
+
+    results, requests, positions = {}, [], []
+    batch = None
+    try:
+        for i, call in enumerate(calls):
+            if i >= allowance:
+                results[i] = "tool-call limit reached: answer with what you have"
+                continue
+            function = call["function"]
+            show_status(f"tool {function['name']}")
+            prepared = _prepare_tool(
+                cfg, function["name"], function["arguments"], streamed_call=call_stream.shown_call(call),
+            )
+            if isinstance(prepared, str):
+                results[i] = prepared
+            else:
+                tool, arguments = prepared
+                requests.append({"name": tool.name, "arguments": arguments})
+                positions.append(i)
+        if requests:
+            show_status(f"web calls 0/{len(requests)}")
+            with WebBatch(requests, searx=cfg.searx) as batch:
+                for index, result in batch:
+                    results[positions[index]] = result
+                    show_status(f"web calls {len(batch.results)}/{len(requests)}")
+    except KeyboardInterrupt:
+        # close() has stopped/reaped workers and collected any complete replies.
+        # Keep those replies, and distinguish sent requests from queued calls.
+        if batch is not None:
+            results.update({positions[index]: result for index, result in batch.results.items()})
+        started = {positions[index] for index in batch.started} if batch is not None else set()
+        for i in range(len(calls)):
+            results.setdefault(i, "interrupted web request: it may have been sent, but no complete result was received"
+                               if i in started else "not run: interrupted by the user")
+        raise
+    finally:
+        for i in sorted(results):
+            record_result(calls[i], results[i])
 
 
 def _approx_messages(messages: list[dict]) -> int:
@@ -668,6 +735,7 @@ def run(cfg: ReplConfig) -> None:
         round_text: list[str] = []
         round_reasoning: list[str] = []
         awaiting: list[dict] = []  # the model's tool calls that have no reply yet
+        round_recorded = False
         in_reasoning, t0, rounds, calls_used = False, time.time(), 0, 0
         # Context position for the status line: the server's running timings once a round streams; until
         # then the last turn's exact number (or a character-count guess) plus what has been added since.
@@ -683,12 +751,22 @@ def run(cfg: ReplConfig) -> None:
             sys.stdout.write(text)
             status.wrote(text)
 
+        def record_tool_result(call, result):
+            nonlocal ctx_est
+            _print_tool_result(result)
+            status.wrote("\n")  # printed lines end at the left margin
+            messages.append({"role": "tool", "tool_call_id": call["id"],
+                             "name": call["function"]["name"], "content": result})
+            ctx_est += _approx_messages(messages[-1:])
+            awaiting.remove(call)
+
         try:
             with status:
                 while True:
                     round_text, round_reasoning, pending_calls, progress, phase = [], [], None, None, "prompt"
+                    round_recorded = False
                     show(phase, force=True)
-                    with ToolCallStream(status) as call_stream:
+                    with ToolCallStream(status, color=con.color_system is not None and not con.no_color) as call_stream:
                         for ev in stream_chat(cfg.url, messages, n_ctx=cfg.n_ctx, sampling=sampling, max_tokens=cfg.max_tokens, chat_template_kwargs=kwargs, api_key=cfg.api_key, tools=tool_specs):
                             if isinstance(ev, TurnStats):
                                 last = ev
@@ -733,6 +811,7 @@ def run(cfg: ReplConfig) -> None:
                     if not pending_calls:
                         break
                     messages.append(_assistant_message(round_text, round_reasoning, pending_calls))
+                    round_recorded = True
                     awaiting = list(pending_calls)
                     if tool_specs is None:
                         for call in pending_calls:
@@ -746,19 +825,31 @@ def run(cfg: ReplConfig) -> None:
                     rounds += 1
                     ctx_est = progress.ctx_used if progress else ctx_est  # exact at the end of the round…
                     progress = None  # …then tool results are added by estimate until the next round reports
-                    for call in pending_calls:
+                    position = 0
+                    while position < len(pending_calls):
+                        call = pending_calls[position]
                         name, arguments = call["function"]["name"], call["function"]["arguments"]
+                        end = position + 1
+                        if name in T.WEB_TOOL_NAMES:
+                            while end < len(pending_calls) and pending_calls[end]["function"]["name"] in T.WEB_TOOL_NAMES:
+                                end += 1
+                        if end - position > 1:
+                            allowance = max(0, MAX_TOOL_CALLS - calls_used)
+                            calls_used += min(allowance, end - position)
+                            _invoke_web_group(
+                                cfg, pending_calls[position:end], call_stream, allowance=allowance,
+                                record_result=record_tool_result, show_status=lambda phase: show(phase, force=True),
+                            )
+                            position = end
+                            continue
                         show(f"tool {name}", force=True)
                         if calls_used >= MAX_TOOL_CALLS:
                             result = "tool-call limit reached: answer with what you have"
                         else:
                             calls_used += 1
-                            result = _invoke_tool(cfg, name, arguments)
-                        _print_tool_result(result)
-                        status.wrote("\n")  # printed lines end at the left margin
-                        messages.append({"role": "tool", "tool_call_id": call["id"], "name": name, "content": result})
-                        ctx_est += _approx_messages(messages[-1:])
-                        awaiting.remove(call)
+                            result = _invoke_tool(cfg, name, arguments, streamed_call=call_stream.shown_call(call))
+                        record_tool_result(call, result)
+                        position += 1
                     if rounds >= MAX_TOOL_ROUNDS or calls_used >= MAX_TOOL_CALLS:
                         con.print("[yellow]tool-call limit reached; requesting a final answer[/]")
                         status.wrote("\n")
@@ -780,7 +871,7 @@ def run(cfg: ReplConfig) -> None:
                 for call in awaiting:
                     messages.append({"role": "tool", "tool_call_id": call["id"], "name": call["function"]["name"], "content": note})
                     note = "not run: interrupted by the user"
-            elif round_text or round_reasoning:
+            elif (round_text or round_reasoning) and not round_recorded:
                 messages.append(_assistant_message(round_text, round_reasoning))
             if messages[-1]["role"] != "assistant":  # keep roles alternating for strict templates
                 messages.append({"role": "assistant", "content": NO_OUTPUT})

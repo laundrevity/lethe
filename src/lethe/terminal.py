@@ -25,18 +25,93 @@ def terminal_safe(text: str) -> str:
     return text.translate(_DISPLAY_ESCAPES)
 
 
-class ToolCallStream:
-    """Append tool names and raw JSON arguments as they arrive, labeled by call index.
+class _CodeArgumentsPreview:
+    """Decode JSON string escapes for display, without parsing or executing a call.
 
-    This is a preview only; the complete call or file diff is still shown before approval. Keeping
-    fragments verbatim avoids interpreting unfinished JSON. Interleaved calls get a fresh label
-    whenever the index changes; previously printed arguments are never repeated or buffered here.
+    Keep the surrounding punctuation so every field remains visible. Only the
+    current escape (at most six characters) and a UTF-16 high surrogate need to
+    wait for another chunk. This never changes the arguments stored in history.
     """
 
-    def __init__(self, status: StatusLine):
+    _ESCAPES = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+
+    def __init__(self):
+        self.in_string = False
+        self.escape = ""
+        self.high_surrogate: int | None = None
+
+    def _character(self, ch: str) -> str:
+        point = ord(ch)
+        prefix = ""
+        if self.high_surrogate is not None:
+            high, self.high_surrogate = self.high_surrogate, None
+            if 0xDC00 <= point <= 0xDFFF:
+                return chr(0x10000 + ((high - 0xD800) << 10) + point - 0xDC00)
+            prefix = f"\\u{high:04x}"
+        if 0xD800 <= point <= 0xDBFF:
+            self.high_surrogate = point
+            return prefix
+        return prefix + (f"\\u{point:04x}" if 0xDC00 <= point <= 0xDFFF else ch)
+
+    def pending(self) -> str:
+        """Show incomplete escapes literally when a stream ends or is interrupted."""
+        tail = f"\\u{self.high_surrogate:04x}" if self.high_surrogate is not None else ""
+        self.high_surrogate = None
+        tail += self.escape
+        self.escape = ""
+        return tail
+
+    def feed(self, text: str) -> str:
+        out = []
+        for ch in text:
+            if self.escape:
+                self.escape += ch
+                if len(self.escape) == 2:
+                    if ch == "u":
+                        continue
+                    out.append(self._character(self._ESCAPES[ch]) if ch in self._ESCAPES else self.pending())
+                    self.escape = ""
+                elif ch not in "0123456789abcdefABCDEF":
+                    out.append(self.pending())
+                elif len(self.escape) == 6:
+                    out.append(self._character(chr(int(self.escape[2:], 16))))
+                    self.escape = ""
+                continue
+            if self.in_string:
+                if ch == "\\":
+                    self.escape = ch
+                elif ch == '"':
+                    out.append(self.pending() + ch)
+                    self.in_string = False
+                else:
+                    out.append(self._character(ch))
+            else:
+                if ch == '"':
+                    self.in_string = True
+                out.append(ch + "\n" if ch == "," else ch)
+        return "".join(out)
+
+
+class ToolCallStream:
+    """Append tool names and arguments as they arrive, labeled by call index.
+
+    Python, Bash and SSH code get decoded previews; other tools keep raw JSON. This is
+    presentation only. A matching, contiguous preview can be reused for approval;
+    interleaved or changed calls need a complete final rendering instead.
+    """
+
+    def __init__(self, status: StatusLine, *, color: bool | None = None):
         self.status = status
         self.out = status.out
+        if color is None:
+            color = "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
+        self.color = bool(color and _is_tty(self.out))
         self.names: dict[int, str] = {}
+        self.ids: dict[int, str] = {}
+        self.arguments: dict[int, list[str]] = {}
+        self.segments: dict[int, int] = {}
+        self.unusable: set[int] = set()
+        self.code_previews: dict[int, _CodeArgumentsPreview] = {}
         self.index: int | None = None
         self.in_arguments = False
 
@@ -44,33 +119,79 @@ class ToolCallStream:
         return self
 
     def __exit__(self, *exc) -> None:
+        for index, preview in self.code_previews.items():
+            if tail := preview.pending():
+                self._select(index)
+                if not self.in_arguments:
+                    self._write("\n")
+                    self.in_arguments = True
+                self._write(tail)
         self.finish()
 
     def _write(self, text: str) -> None:
         text = terminal_safe(text)
-        self.out.write(text)
+        # Color each fragment independently: status redraws reset attributes.
+        # Only visible text participates in right-margin/wrap accounting.
+        self.out.write(f"\x1b[36m{text}\x1b[0m" if self.color and text else text)
         self.status.wrote(text)
+
+    def _select(self, index: int) -> None:
+        if index != self.index:
+            self.finish()
+            if self.status.col:
+                self._write("\n")
+            self.index = index
+            self.segments[index] = self.segments.get(index, 0) + 1
+            self._write(f"⚙ tool call {index + 1}: {self.names[index]}")
 
     def feed(self, fragments: list[dict]) -> None:
         for fragment in fragments:
             index = fragment.get("index", 0)
             function = fragment.get("function") or {}
             name, arguments = function.get("name") or "", function.get("arguments") or ""
+            self.ids[index] = fragment.get("id") or self.ids.get(index, f"call_{index}")
+            if name and self.arguments.get(index):
+                # A late name may have selected a different decoder midway.
+                self.unusable.add(index)
             self.names[index] = self.names.get(index, "") + name
-            if index != self.index or (name and self.in_arguments):
+            if name and self.in_arguments and index == self.index:
                 self.finish()
-                if self.status.col:
-                    self._write("\n")
-                self.index = index
-                self._write(f"⚙ tool call {index + 1} (streaming): {self.names[index]}")
+            if index != self.index:
+                self._select(index)
             elif name:
                 self._write(name)
             if arguments:
+                self.arguments.setdefault(index, []).append(arguments)
                 if not self.in_arguments:
                     self._write("\n")
                     self.in_arguments = True
-                self._write(arguments)
+                if self.names[index] in {"run_ssh", "run_python", "run_bash"}:
+                    preview = self.code_previews.setdefault(index, _CodeArgumentsPreview())
+                    self._write(preview.feed(arguments))
+                else:
+                    self._write(arguments)
         self.out.flush()
+
+    def shown_call(self, call: dict) -> int | None:
+        """Return the 1-based label of an exact, uninterrupted displayed call.
+
+        This is only a display receipt. The caller must independently establish
+        stream completion and validate the arguments before asking for approval.
+        """
+        function = call.get("function") or {}
+        call_id = call.get("id") or f"call_{call.get('index', 0)}"
+        matches = [index for index, shown_id in self.ids.items() if shown_id == call_id]
+        if len(matches) != 1:
+            return None
+        index = matches[0]
+        if index in self.unusable or self.segments.get(index) != 1 or index not in self.arguments:
+            return None
+        if self.names[index] != function.get("name") or "".join(self.arguments[index]) != function.get("arguments"):
+            return None
+        preview = self.code_previews.get(index)
+        if preview is not None and (preview.escape or preview.high_surrogate is not None):
+            return None  # Some source has not reached the terminal yet.
+        return index + 1
 
     def finish(self) -> None:
         if self.index is not None:

@@ -42,6 +42,8 @@ So the defaults are:
 | `chat` REPL | writes nothing; no history file (Up-arrow recall is in-memory only) | `/wipe` clears the conversation **and** the terminal scrollback |
 | terminal notifications | bell + a fixed phrase ("lethe: reply finished", "lethe: a tool call needs your approval") | Notification Center keeps notification text around, so no conversation content ever goes into one |
 | shell and file tools | **on, full access** (equivalent to `--tools --shell-mode full`) | commands and file operations require approval; writes show a diff. `--no-tools` disables tools; `--shell-mode read-only` selects the offline macOS sandbox. Full mode allows writes, network, and inherited environment; command side effects can persist |
+| local Python/Bash | available in full mode; each call requires approval | `run_python` sends raw source through stdin; `run_bash` takes command arrays. No script files, history, or Python bytecode caches are created by the runner; approved code can write files or use the network |
+| SSH tool | available in full mode; each call requires approval | `run_ssh` sends Bash/Python through stdin, with no temporary scripts, local logs, known_hosts updates, or persistent connections. Your SSH configuration, remote auditing, and approved commands may create records or files |
 | image/video attachments and image tool | explicit `--vision` enables `view_image`; `/image`, `/video`, or `-f` attach media manually | local files only; image tool calls require approval unless `--auto-approve files\|all` is set; `--no-tools` disables the tool; decoded video frames and WebP conversions stay in memory; FFmpeg network protocols, reports, and disk caches are disabled; no extracted files or audio transcripts |
 | saved conversations | **off**; `chat --save` / `/save` opt in **per invocation** — `--resume ID` only reads | AES-256-GCM, key from your passphrase via scrypt, passphrase never stored; random filenames, title/model inside the ciphertext; `lethe conversations` lists ids only (`--unlock` to see titles), `--delete` overwrites then removes |
 | clipboard | only on explicit `/copy` | clipboard managers and Universal Clipboard can persist or forward that, so it's never automatic |
@@ -99,6 +101,18 @@ address that was checked (no DNS rebinding). The default system prompt stops cla
 network silence when internet tools or full-access shell mode are on. Full-access commands can also
 write files or logs; Lethe's in-memory conversation handling does not prevent those command side effects.
 
+Consecutive `web_search`/`fetch_url` calls in one model response run concurrently, up to four tool calls
+at once. Calls are displayed and, with `--tools-confirm`, individually approved before the batch starts;
+declines and `p` notes never launch requests. Results enter the conversation in request order. File, shell,
+and SSH operations are ordering boundaries and remain sequential. A request that depends on another
+result belongs in a later model turn.
+
+Each parallel web call runs in a short-lived Python worker with a 60-second wall-clock limit.
+Requests/results travel through bounded in-memory pipes, with no content in worker arguments, logs,
+or temporary files. Ctrl-C stops and reaps the workers and their curl children, preserves completed
+results, and marks unfinished requests separately from work that never started. Single web calls retain
+their existing request timeouts. Search providers may contact multiple engines within one tool call.
+
 ## Command-line tool
 
 ```bash
@@ -119,9 +133,76 @@ gets the note as the call's result and may ask again. The terminal bell rings wh
 `--yes` only affects model downloads; shell approval is always required. `/shell` shows the scope;
 `/shell off` removes the tool. `/web off` only removes internet tools.
 
-Tool names and JSON arguments stream to the terminal as the model produces them, so long commands and file
-edits are visible before generation finishes. This is only a preview: approval still shows the complete call
-or file diff, and incomplete or interrupted calls never execute.
+Tool names and arguments stream to the terminal as the model produces them, so long commands and file
+edits are visible before generation finishes. They appear in light blue; SSH strings display decoded source
+with real line breaks. A complete, matching streamed call is not printed again: approval refers to its call
+number and adds the execution scope, without a second SSH summary line. File changes still show
+their computed diff. Interleaved or changed calls get a complete approval view. Incomplete or interrupted
+calls never execute.
+
+For local code, full mode provides **`run_python`** and **`run_bash`**:
+
+```python
+run_python(code="""
+import json
+print(json.dumps({"message": "hello"}))
+""")
+run_bash(commands=["cd ~/project", "git status", "python3 check.py"])
+```
+
+Python source goes directly to `python3 -B -u -` from the inherited PATH. The model does not need
+`python -c`, shell quoting, or heredoc delimiters. Bash requires an array with one command per entry;
+entries share a shell and are chained with `&&`. A loop, pipeline, or conditional can stay together
+in one entry. Both tools accept `cwd` and `timeout_seconds`, with the same 8,000-byte source budget,
+output cap, timeout defaults, and process cleanup as full shell execution. Each call starts fresh.
+They inherit the environment and credentials; shell startup hooks and history are disabled.
+
+These tools require approval, including with `--auto-approve files`; only `all` skips their prompts.
+They are removed by `/shell off`, `/shell read-only`, or `--no-tools`. Read-only mode keeps its existing
+sandboxed `run_shell`; it never falls back to these full-access runners. Streamed source is displayed once,
+without a repeated summary before approval. Python's raw string uses the default Qwen model's native
+multiline tool format; the API's JSON encoding is decoded for display.
+
+Full mode also exposes **`run_ssh`**, with an explicit host and either a Bash or Python payload:
+
+```python
+run_ssh(host="oswald", bash=["cd ~/project", "git status", "python3 check.py"])
+run_ssh(host="oswald", cwd="~/project", python="""
+import json
+from pathlib import Path
+data = json.loads(Path("settings.json").read_text())
+print(data["name"])
+""")
+```
+
+These illustrate tool arguments, not REPL commands. Ask Lethe to use `run_ssh` for remote work.
+Supply exactly one of `bash` or `python`. `bash` requires an array with one command per entry, including
+for a single command. Put separate steps in separate entries instead of joining them with `;` or `&&`.
+A pipeline, loop, or conditional can stay together in one multiline entry. The list runs in one Bash
+process, chained with `&&`: directory and variable changes persist, and each entry must succeed before
+the next starts. Compound entries retain Bash's usual `&&` rules.
+Python uses `python3 -B -u -`. Source goes through stdin, with no
+`python -c`, nested shell quoting, heredocs, or temporary files. The source limit is 8,000 UTF-8 bytes.
+`cwd` is a remote path (supports `~` and `~/`); omit it for the SSH login directory. Config aliases
+like `oswald`, `user@host`, identity files, and configured ports work normally. The remote host needs
+a POSIX login shell and Bash or Python 3, respectively.
+
+The default Qwen model's native tool format carries Python's multiline string directly, avoiding
+generated shell escapes. HTTP arguments still use JSON; Lethe decodes that for display. Command arrays
+are convenient for sequences, but use JSON string encoding and won't always use fewer tokens than scripts.
+
+The streamed call is the approval view; omitted settings use the defaults described here.
+`p` returns your note without connecting.
+`--auto-approve files` still asks; only `--auto-approve all` skips SSH approval. `/shell off`, `/shell read-only`,
+and `--no-tools` remove SSH access. Enabling the tool makes no connection. SSH uses `BatchMode=yes`,
+no TTY, strict host-key checks, no host-key updates, no forwarding, and no connection multiplexing or
+persistence. Establish host trust and noninteractive authentication yourself before using a new host.
+Your SSH configuration is still read, including configured proxy commands.
+
+SSH uses the full-mode timeout and output limits below. Timeout or Ctrl-C stops the local SSH process;
+**remote processes may survive disconnection**. Use foreground commands and check the remote host after
+an interrupted job. Lethe installs no remote supervisor and keeps source/output in memory; remote auditing,
+login configuration, and approved programs can still retain data or write files.
 
 The shell brings file tools with it, so the model does not have to build files out of `cat` heredocs and `sed`:
 
@@ -133,7 +214,8 @@ The shell brings file tools with it, so the model does not have to build files o
 
 Every file tool call asks for confirmation like a shell command. Writes and edits are shown as a **diff** of exactly
 what will change; an edit that cannot apply is returned to the model without prompting you. Lethe keeps no backups,
-temp files, or edit history. `/shell off` removes these tools too, and `/shell read-only` drops the two write tools.
+temp files, or edit history. `/shell off` removes these tools too; `/shell read-only` drops native Python/Bash,
+SSH, and the two write tools.
 
 `--auto-approve files` skips the y/n prompt for file tools, including `view_image` when enabled (shell commands still ask);
 `--auto-approve all` skips it for shell commands too. It is per launch, never a saved setting, and every call and
@@ -166,7 +248,7 @@ network access (including localhost) using your inherited PATH, environment, cre
 and tool configuration. It works with Homebrew tools and virtual environments on that PATH.
 `--shell-dir` sets the starting directory in full mode; commands can access other directories with
 your account's normal permissions. `cwd` accepts relative paths, absolute paths, and `~`.
-Each call starts a fresh noninteractive `/bin/sh`; shell aliases and functions from an interactive
+Each `run_shell` call starts a fresh noninteractive `/bin/sh`; shell aliases and functions from an interactive
 shell are not loaded. Both modes still require confirmation for every command.
 
 For example, `uv run lethe --tools --shell-mode full --shell-dir ~/dev/my-project` enables full
@@ -205,7 +287,7 @@ Full mode defaults to a 120-second wall-clock limit (maximum 600) and uses norma
 It captures up to the same output cap, discarding excess output while the command continues until
 exit or timeout, so verbose builds can finish. Results include `stdout`, `stderr`, `exit_code`,
 `timed_out`, and `truncated`. Both modes clean up normal child processes when a call finishes,
-times out, or is interrupted with Ctrl-C. There are at most 8 tool rounds and 16 calls per user turn.
+times out, or is interrupted with Ctrl-C.
 
 Read-only enforcement uses macOS `/usr/bin/sandbox-exec` (Seatbelt), with a real startup probe. Unsupported
 platforms or sandbox setup errors disable read-only mode; there is no automatic unsandboxed fallback. Apple
@@ -230,6 +312,12 @@ To check the model → shell → model path with the default model, run
 `uv run pytest -q -s tests/test_live_tools.py --run-live-tools`. This opt-in test loads the model
 for its own run, uses the normal thinking sampler, approves only the fixed `printf lethe-shell-smoke-ok`
 command in the read-only sandbox, checks the final answer, and does not save the conversation.
+The same file also checks that the default model generates populated SSH calls for a directory listing,
+a Bash command array, and multiline Python. The SSH test validates arguments without executing the source
+or connecting to any host. Run it alone with
+`uv run pytest -q -s tests/test_live_tools.py::test_live_model_ssh_arguments --run-live-tools`.
+`test_live_model_local_code_and_web_batch` similarly checks native local Python, Bash arrays, and a pair
+of web searches in one response, without executing any of those tools.
 
 ## Setup
 

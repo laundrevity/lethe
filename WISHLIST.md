@@ -1,6 +1,6 @@
 - [ ] show output of tool calls
 - [ ] notify when requiring tool response in terminal tab (like codex / claude code)
-- [ ] parallelize multiple web_search / fetch_url
-- [ ] remove wasted backslash tokens in run_shell e.g. with `python3 -c \"\nimport json\nd=json.load(open(\\\`...
-- [ ] remove duplicated tool call print (and have streaming text appear light blue, like tool call it becomes when streaming finishes)
-- [ ] create separate tool(s) for executing commands over ssh (instead of `⚙ 'run_shell'({"command": "ssh -o BatchMode=yes oswald 'python3 - <<\"EOF\"\nimport struct, json, os\nM=\"/` etc)
+- [x] parallelize consecutive web_search / fetch_url calls (up to four, with ordered results and interrupt cleanup)
+- [x] remove nested local command escaping with `run_python(code)` and `run_bash(commands=[...])`
+- [x] remove duplicated tool call print (stream in light blue; reuse complete calls for approval, keeping file diffs)
+- [x] create a separate SSH tool: `run_ssh(host, bash=[commands] | python=source)`, with readable source and no nested shell quoting

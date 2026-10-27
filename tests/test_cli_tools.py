@@ -147,7 +147,7 @@ def test_default_full_tools_and_opt_out(monkeypatch, tmp_path, flags, enabled, v
     cfg = configs[0]
     assert cfg.auto_approve is None
     if enabled:
-        assert set(cfg.tools) == {"run_shell", "read_file", "write_file", "edit_file"} | ({"view_image"} if vision else set())
+        assert set(cfg.tools) == tools.SHELL_TOOL_NAMES | ({"view_image"} if vision else set())
         assert VACUUM_CLAIM not in cfg.system
         assert tools.FULL_SHELL_NOTE in cfg.system
         assert (tools.IMAGE_TOOL_NOTE in cfg.system) is vision

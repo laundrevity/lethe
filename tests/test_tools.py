@@ -47,7 +47,7 @@ def test_full_shell_requires_confirmation_before_writing(tmp_path, monkeypatch):
     monkeypatch.setattr(ShellSandbox, "check_available", lambda self: pytest.fail("sandbox must not be probed"))
     registry = tools.build_registry(["shell", "web"], shell_dir=tmp_path, shell_mode=ShellMode.FULL)
     tool = registry["run_shell"]
-    assert set(registry) == {"run_shell", "read_file", "write_file", "edit_file", "web_search", "fetch_url"}
+    assert set(registry) == {"run_shell", "run_python", "run_bash", "run_ssh", "read_file", "write_file", "edit_file", "web_search", "fetch_url"}
     assert tool.shell_mode == ShellMode.FULL and tool.requires_confirmation
     assert "files writable" in tool.confirmation_context and "network allowed" in tool.confirmation_context
     assert tool.parameters["properties"]["timeout_seconds"]["maximum"] == 600

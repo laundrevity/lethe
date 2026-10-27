@@ -37,6 +37,25 @@ model's inputs and outputs. Every feature must preserve that:
   the per-invocation opt-in `--auto-approve files|all` (calls and diffs are still printed; never make it a default or
   a `lethe.toml` setting). The default system prompt's "nothing leaves this machine" claim is patched by
   `tools.sync_system_text` to match what is enabled.
+- **Local native code** uses full-mode `run_python(code)` and `run_bash(commands=[...])` in `shell.py`.
+  Python is `python3 -B -u -` on inherited PATH; Bash arrays are chained with `&&` in one shell. Source
+  travels only over stdin. Both validate before approval and share shell limits/cleanup; `files` auto-approval
+  does not cover them. Read-only mode never exposes them. Streamed source is decoded and shown once.
+- **Parallel web calls** (`webbatch.py`, `web_worker.py`) group only consecutive web_search/fetch_url calls
+  within a model response; other tools remain ordering boundaries. Display/approval stays on the main thread
+  before a batch starts. At most four isolated Python workers run, with 60-second deadlines and bounded pipes;
+  no content in worker argv, files, or logs. Results are recorded in request order. Ctrl-C kills/reaps worker process
+  groups (including curl), preserves completed replies, and distinguishes sent requests from queued work.
+- **SSH execution** (`ssh.py`) is part of full shell mode only: `run_ssh(host, bash=... | python=...)`.
+  Bash requires an array with one command per entry, chained with `&&` in one shell; multiline shell constructs
+  stay together in one entry. Python takes raw source.
+  Source goes through stdin, never shell-quoted into argv or written to temporary scripts. Every call needs
+  approval unless `--auto-approve all` (not `files`); `p` never connects. Batch-mode SSH reads existing config
+  and trusted host keys, with no known_hosts updates, forwarding, or persistent connection. Remote audit/config
+  and approved code may persist data; stopping local SSH does not guarantee remote process termination.
+  `/shell off` and read-only mode remove the tool. Streaming source is decoded for display only; context stays intact.
+  Tool parameter schemas must keep an object root: llama.cpp's XML parser drops all parameters if root `oneOf`
+  or `anyOf` is present. Enforce Bash/Python exclusivity in the preview/runner, not a root schema union.
 - **Media attachments** (`attachments.py`, `video.py`) are explicit (`--vision` plus `/image`, `/video`, or `-f`).
   `--vision` also enables `view_image(path)` automatically unless `--no-tools` is set. It uses the same
   in-memory image loader and file path rules (workspace-confined in read-only mode); approval is required
@@ -49,9 +68,11 @@ model's inputs and outputs. Every feature must preserve that:
 - **Terminal presentation lives in `terminal.py`.** `StatusLine` pins one line to the bottom row during a turn
   (DECSTBM scroll region; Apple Terminal keeps the scrollback for a top-anchored region but drops the pending-wrap
   flag across cursor save/restore — hence the column tracking and no redraw at the right margin). `notify()` is the
-  bell plus OSC 9/99; its text must stay content-free (Notification Center retains it). The kitty keyboard protocol
-  is pushed only while prompt_toolkit reads a line: left on, Ctrl-C during streaming is no longer SIGINT. Apple
-  Terminal cannot report Shift+Enter at all; don't promise it there.
+  bell plus OSC 9/99; its text must stay content-free (Notification Center retains it). Streamed tool calls are cyan;
+  approval reuses them only if the final ID/name/arguments exactly match one contiguous display block. Otherwise
+  render the complete call. Always validate previews and show file diffs; never approve from streaming fragments.
+  The kitty keyboard protocol is pushed only while prompt_toolkit reads a line: left on, Ctrl-C during streaming
+  is no longer SIGINT. Apple Terminal cannot report Shift+Enter at all; don't promise it there.
 - **No background model server, ever.** `lethe` is to a local model what claude code is to Claude: the
   model is loaded when a run starts and unloaded when it ends. `server.Session` starts `llama-server` on a
   free loopback port and kills it on exit (`with` block, atexit, SIGTERM/SIGHUP handlers; only SIGKILL of

@@ -13,7 +13,8 @@ from lethe.profiles import Profile
 
 
 @pytest.mark.parametrize("ending", ["complete", "length", "disconnect", "interrupt"])
-def test_tool_arguments_stream_before_approval_and_only_complete_calls_run(monkeypatch, ending):
+@pytest.mark.parametrize("tool_name", ["run_shell", "run_ssh"])
+def test_tool_arguments_stream_before_approval_and_only_complete_calls_run(monkeypatch, ending, tool_name):
     output = io.StringIO()
     monkeypatch.setattr(repl.sys, "stdout", output)
     monkeypatch.setattr(repl, "con", Console(file=output, color_system=None, width=1000))
@@ -22,12 +23,14 @@ def test_tool_arguments_stream_before_approval_and_only_complete_calls_run(monke
     saved, approved, executed, requests = [], [], [], []
     monkeypatch.setattr(repl.vault, "save", lambda conv, pw: saved.append(copy.deepcopy(conv.messages)))
     command = "printf " + "x" * 2000 + " tail"
-    arguments = json.dumps({"command": command})
+    source = 'import json\nprint(json.dumps({"message": "' + "x" * 2000 + '", "path": r"a\\b", "emoji": "😀"}))\n# tail'
+    payload = {"command": command} if tool_name == "run_shell" else {"host": "oswald", "python": source}
+    arguments = json.dumps(payload)
     finished = False
 
     def approve():
         assert finished  # syntax-complete JSON alone must never trigger approval
-        assert arguments in output.getvalue()
+        assert (arguments if tool_name == "run_shell" else source) in output.getvalue()
         approved.append(True)
         return True
 
@@ -42,14 +45,22 @@ def test_tool_arguments_stream_before_approval_and_only_complete_calls_run(monke
             yield chunk({"reasoning_content": "Need a command."})
             yield chunk({"content": "Checking now."})
             yield chunk({"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "run_"}}]})
-            assert "Checking now.\n⚙ tool call 1 (streaming): run_" in output.getvalue()
-            yield chunk({"tool_calls": [{"index": 0, "function": {"name": "shell", "arguments": arguments[:1000]}}]})
-            assert arguments[:1000] in output.getvalue() and " tail" not in output.getvalue()
+            assert "Checking now.\n⚙ tool call 1: run_" in output.getvalue()
+            if tool_name == "run_ssh":
+                split = arguments.index("\\n") + 1  # JSON escape itself crosses two SSE events
+                yield chunk({"tool_calls": [{"index": 0, "function": {"name": "ssh", "arguments": arguments[:split]}}]})
+                assert "import json" in output.getvalue() and "print(json" not in output.getvalue()
+                yield chunk({"tool_calls": [{"index": 0, "function": {"arguments": arguments[split:1000]}}]})
+                assert 'import json\nprint(json.dumps({"message": "' in output.getvalue()
+            else:
+                yield chunk({"tool_calls": [{"index": 0, "function": {"name": "shell", "arguments": arguments[:1000]}}]})
+                assert arguments[:1000] in output.getvalue()
+            assert " tail" not in output.getvalue()
             assert not approved and not executed and not saved
             if ending == "interrupt":
                 raise KeyboardInterrupt
             yield chunk({"tool_calls": [{"index": 0, "function": {"arguments": arguments[1000:]}}]})
-            assert arguments in output.getvalue()
+            assert (arguments if tool_name == "run_shell" else source) in output.getvalue()
             assert not approved and not executed and not saved
             yield chunk({}, "length" if ending == "length" else "tool_calls")
             assert not approved and not executed
@@ -65,20 +76,25 @@ def test_tool_arguments_stream_before_approval_and_only_complete_calls_run(monke
 
     client_type = httpx.Client
     monkeypatch.setattr(chat.httpx, "Client", lambda **kwargs: client_type(transport=httpx.MockTransport(respond), **kwargs))
-    registry = {"run_shell": tools.Tool("run_shell", "test", {
-        "type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"],
-    }, lambda **args: executed.append(args) or "result", requires_confirmation=True)}
+    registry = {tool_name: tools.Tool(tool_name, "test", {
+        "type": "object", "properties": {key: {"type": "string"} for key in payload}, "required": list(payload),
+    }, lambda **args: executed.append(args) or "result", requires_confirmation=True,
+        preview=(lambda host, python: f"{host} (Python)\n{python}") if tool_name == "run_ssh" else None)}
     repl.run(repl.ReplConfig("http://localhost", None, 4096, "test-model", Profile("test", {}, {}),
                              tools=registry, save=True, passphrase="pw"))
     if ending == "complete":
-        assert approved == [True] and executed == [{"command": command}]
+        assert approved == [True] and executed == [payload]
+        shown = output.getvalue()
+        assert shown.count(arguments if tool_name == "run_shell" else source) == 1
+        assert "⚙ '" + tool_name + "'" not in shown
         assert len(requests) == 2
         message = saved[0][1]
         assert message["content"] == "Checking now." and message["reasoning_content"] == "Need a command."
         assert message["tool_calls"] == [{"id": "c1", "type": "function", "function": {
-            "name": "run_shell", "arguments": arguments,
+            "name": tool_name, "arguments": arguments,
         }}]
         assert requests[1]["messages"][-1]["role"] == "tool"
+        assert requests[1]["messages"][-2]["tool_calls"][0]["function"]["arguments"] == arguments
     else:
         assert not approved and not executed and len(requests) == 1
         if ending == "interrupt":

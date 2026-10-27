@@ -175,6 +175,58 @@ class FullShell:
             stop_on_output_limit=False,
         )
 
+    def _code_directory(self, cwd: str) -> Path:
+        if not isinstance(cwd, str) or "\0" in cwd:
+            raise ValueError("cwd must be an existing directory")
+        return _resolve_directory(self.root / Path(cwd).expanduser())
+
+    def _python_source(self, code: str, cwd: str, timeout_seconds: int) -> tuple[str, Path]:
+        _validate_command(code, timeout_seconds, FULL_MAX_TIMEOUT)
+        return code, self._code_directory(cwd)
+
+    def _bash_source(self, commands: list[str], cwd: str, timeout_seconds: int) -> tuple[str, Path]:
+        if not isinstance(commands, list) or not commands:
+            raise ValueError("commands must be a nonempty array of Bash commands")
+        for command in commands:
+            _validate_command(command, timeout_seconds, FULL_MAX_TIMEOUT)
+        if sum(len(command.encode("utf-8")) for command in commands) > MAX_COMMAND_BYTES:
+            raise ValueError(f"commands exceed {MAX_COMMAND_BYTES:,} UTF-8 bytes in total")
+        # Groups share cwd and variables; each final status gates the next group.
+        # Newlines protect closing braces from trailing comments and heredocs.
+        source = " &&\n".join("{\n" + command + "\n}" for command in commands) + "\n"
+        return source, self._code_directory(cwd)
+
+    def _execute_code(self, argv: list[str], source: str, cwd: Path, timeout_seconds: int) -> dict:
+        env = {
+            **os.environ, "HISTFILE": "/dev/null", "BASH_ENV": "/dev/null", "ENV": "/dev/null",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        return _run_bounded(
+            argv, source.encode("utf-8"), cwd, env, timeout_seconds, stop_on_output_limit=False,
+        )
+
+    def run_python(self, code: str, cwd: str = ".", timeout_seconds: int = FULL_DEFAULT_TIMEOUT) -> str:
+        return json.dumps(self.execute_python(code=code, cwd=cwd, timeout_seconds=timeout_seconds), ensure_ascii=False)
+
+    def execute_python(self, code: str, cwd: str = ".", timeout_seconds: int = FULL_DEFAULT_TIMEOUT) -> dict:
+        source, workdir = self._python_source(code, cwd, timeout_seconds)
+        return self._execute_code(["python3", "-B", "-u", "-"], source, workdir, timeout_seconds)
+
+    def preview_python(self, code: str, cwd: str = ".", timeout_seconds: int = FULL_DEFAULT_TIMEOUT) -> str:
+        source, workdir = self._python_source(code, cwd, timeout_seconds)
+        return f"python · cwd={ascii(str(workdir))} · timeout={timeout_seconds}s\n{source}"
+
+    def run_bash(self, commands: list[str], cwd: str = ".", timeout_seconds: int = FULL_DEFAULT_TIMEOUT) -> str:
+        return json.dumps(self.execute_bash(commands=commands, cwd=cwd, timeout_seconds=timeout_seconds), ensure_ascii=False)
+
+    def execute_bash(self, commands: list[str], cwd: str = ".", timeout_seconds: int = FULL_DEFAULT_TIMEOUT) -> dict:
+        source, workdir = self._bash_source(commands, cwd, timeout_seconds)
+        return self._execute_code(["bash", "--noprofile", "--norc", "-s"], source, workdir, timeout_seconds)
+
+    def preview_bash(self, commands: list[str], cwd: str = ".", timeout_seconds: int = FULL_DEFAULT_TIMEOUT) -> str:
+        source, workdir = self._bash_source(commands, cwd, timeout_seconds)
+        return f"bash ({len(commands)} commands, &&) · cwd={ascii(str(workdir))} · timeout={timeout_seconds}s\n{source}"
+
 
 def _kill_group(proc: subprocess.Popen) -> None:
     try:

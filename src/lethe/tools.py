@@ -4,6 +4,7 @@ Nothing here runs unless tools are enabled. Internet tools send model-composed
 queries and URLs off-machine. Shell commands use the selected execution mode;
 the shell brings file tools with it (files.py): read_file, plus write_file and
 edit_file in full-access mode only.
+Full mode also exposes run_python, run_bash and run_ssh with source sent through stdin.
 Vision sessions also expose view_image, returning image content in memory.
 The REPL prints calls; shell and file tools always ask y/n, web tools do so with `--tools-confirm`.
 Results live in memory; full-access shell commands may write files themselves.
@@ -47,6 +48,10 @@ SYSTEM_NOTE = (
     "training-era knowledge of recent events, the results win — especially when independent sources agree."
 )
 WEB_TOOL_NAMES = {"web_search", "fetch_url"}
+WEB_PARALLEL_NOTE = (
+    "\nRequest independent web searches and page fetches together in the same turn; Lethe runs up to four "
+    "concurrently. If a request needs an earlier result, wait for that result before requesting it."
+)
 SHELL_NOTE = (
     "\nThe user has enabled run_shell: a local, read-only macOS sandbox. It can read the selected "
     "workspace and system utilities, but cannot write files or use the network. Every command requires "
@@ -67,8 +72,36 @@ FILE_TOOLS_NOTE = (
     "run_shell; keep run_shell for running programs, tests, git, and searching. Read a file before editing it, and "
     "make several small edit_file calls rather than rewriting a large file."
 )
-SHELL_TOOL_NAMES = {"run_shell", "read_file", "write_file", "edit_file"}
-FILE_TOOL_NAMES = (SHELL_TOOL_NAMES - {"run_shell"}) | {"view_image"}
+_LEGACY_SSH_NOTE = (
+    "\nFor remote execution use run_ssh instead of constructing ssh commands in run_shell. "
+    "Pass host separately and exactly one payload: bash (a command list chained like && in one shell, "
+    "or a multiline script), or python (literal Python source). Do not add shell quoting, python -c, "
+    "heredocs, or a second layer of JSON encoding to the source. cwd refers to the remote host. "
+    "SSH uses batch authentication and existing trusted host keys. Each call requires approval; "
+    "remote commands can write files and send data. A timeout or interrupt disconnects SSH but may "
+    "leave remote processes running. Use foreground commands only."
+)
+SSH_NOTE = (
+    "\nFor remote execution use run_ssh instead of constructing ssh commands in run_shell. "
+    "Pass host separately and exactly one payload: bash (an array with one command per entry), "
+    "or python (literal Python source). For example, bash=[\"pwd\", \"uname -s\"]. Do not join "
+    "separate commands with ; or && inside an entry; Lethe chains the entries in one shell and stops "
+    "on failure. Keep a loop, conditional, or other multiline shell construct together in one entry. "
+    "Do not add shell quoting, python -c, heredocs, or a second layer of JSON encoding to Python source. "
+    "cwd refers to the remote host. SSH uses batch authentication and existing trusted host keys. "
+    "Each call requires approval; remote commands can write files and send data. A timeout or interrupt "
+    "disconnects SSH but may leave remote processes running. Use foreground commands only."
+)
+LOCAL_CODE_NOTE = (
+    "\nUse run_python for local Python: pass literal multiline code directly, without python -c, shell quoting, "
+    "or heredocs. Use run_bash for local Bash command sequences: one command per array entry, e.g. "
+    "commands=[\"pwd\", \"uname -s\"]. Lethe chains entries in one shell and stops on failure; do not join "
+    "separate steps with ; or &&. Keep a loop or conditional together in one entry. Both tools have full "
+    "local access and require approval, like run_shell. Prefer the file tools for text edits."
+)
+CODE_TOOL_NAMES = {"run_python", "run_bash", "run_ssh"}
+SHELL_TOOL_NAMES = {"run_shell", "read_file", "write_file", "edit_file"} | CODE_TOOL_NAMES
+FILE_TOOL_NAMES = {"read_file", "write_file", "edit_file", "view_image"}
 IMAGE_TOOL_NOTE = (
     "\nUse view_image to inspect local images: its tool result contains the image for you to see. "
     "Use it instead of read_file or shell commands that dump image bytes or base64. "
@@ -81,6 +114,21 @@ TOOL_ACCESS_NOTE = (
     "a shell with file writes and network access, or /tools full for both web tools and full shell access. "
     "The user can enable them without restarting or losing this conversation. Use only tools currently available."
 )
+
+
+def _validate_argument(key: str, value, schema: dict) -> None:
+    types = schema.get("type", [])
+    types = [types] if isinstance(types, str) else types
+    expected = {"string": str, "integer": int, "boolean": bool, "array": list}
+    if types and not any(type(value) is expected.get(t) for t in types):
+        raise ValueError(f"{key} must be a {' or '.join(types)}")
+    if type(value) is int and (value < schema.get("minimum", value) or value > schema.get("maximum", value)):
+        raise ValueError(f"{key} is outside its allowed range")
+    if isinstance(value, list):
+        if len(value) < schema.get("minItems", 0):
+            raise ValueError(f"{key} must contain at least {schema['minItems']} item(s)")
+        for i, item in enumerate(value):
+            _validate_argument(f"{key}[{i}]", item, schema.get("items", {}))
 
 
 @dataclass(frozen=True)
@@ -108,12 +156,7 @@ class Tool:
         if missing := set(self.parameters.get("required", [])) - args.keys():
             raise ValueError("missing tool argument(s): " + ", ".join(sorted(missing)))
         for key, value in args.items():
-            schema = properties[key]
-            expected = {"string": str, "integer": int, "boolean": bool}.get(schema.get("type"))
-            if expected and type(value) is not expected:
-                raise ValueError(f"{key} must be a {schema['type']}")
-            if type(value) is int and (value < schema.get("minimum", value) or value > schema.get("maximum", value)):
-                raise ValueError(f"{key} is outside its allowed range")
+            _validate_argument(key, value, properties[key])
         return args
 
 
@@ -131,20 +174,25 @@ def _sync_builtin(text: str, registry: dict[str, Tool]) -> str:
     if marker not in text:
         return text
     text = text.replace(SYSTEM_NOTE, "").replace(SHELL_NOTE, "").replace(FULL_SHELL_NOTE, "").replace(TOOL_ACCESS_NOTE, "")
-    text = text.replace(FILE_TOOLS_NOTE, "").replace(IMAGE_TOOL_NOTE, "")
+    text = text.replace(FILE_TOOLS_NOTE, "").replace(IMAGE_TOOL_NOTE, "").replace(SSH_NOTE, "").replace(_LEGACY_SSH_NOTE, "")
+    text = text.replace(LOCAL_CODE_NOTE, "").replace(WEB_PARALLEL_NOTE, "")
     text = text.replace(marker + VACUUM_CLAIM, marker)
     shell = registry.get("run_shell")
     full_shell = shell is not None and shell.shell_mode == ShellMode.FULL
     if full_shell:
         text = text.replace(marker + PRIVACY_NOTE, FULL_SHELL_PRIVACY_NOTE)
     if WEB_TOOL_NAMES.intersection(registry):
-        text += SYSTEM_NOTE
+        text += SYSTEM_NOTE + WEB_PARALLEL_NOTE
     elif not full_shell:
         text = text.replace(marker, marker + VACUUM_CLAIM, 1)
     if shell is not None:
         text += FULL_SHELL_NOTE if full_shell else SHELL_NOTE
     if "write_file" in registry:
         text += FILE_TOOLS_NOTE
+    if "run_ssh" in registry:
+        text += SSH_NOTE
+    if "run_python" in registry or "run_bash" in registry:
+        text += LOCAL_CODE_NOTE
     if "view_image" in registry:
         text += IMAGE_TOOL_NOTE
     return text + TOOL_ACCESS_NOTE
@@ -331,7 +379,7 @@ def build_registry(
             fn=lambda query, max_results=8: web_search(query, max_results, searx=searx),
         ),
     }
-    file_tools: list[Tool] = []
+    shell_companions: list[Tool] = []
     if "shell" in names:
         from .files import FileTools
         from .shell import FULL_DEFAULT_TIMEOUT, FULL_MAX_TIMEOUT, MAX_TIMEOUT, FullShell, ShellSandbox
@@ -382,12 +430,84 @@ def build_registry(
             confirmation_context=context,
             shell_mode=shell_mode,
         )
+        if shell_mode == ShellMode.FULL:
+            from .ssh import SSHRunner
+
+            for name, source_name, source_schema, description, fn, preview in (
+                (
+                    "run_python", "code", {"type": "string", "description": "Literal multiline Python source, max 8,000 UTF-8 bytes"},
+                    "Run local Python 3 source directly through stdin, without python -c, shell quoting, or heredocs. "
+                    "Uses python3 from your PATH with bytecode writes disabled.", runner.run_python, runner.preview_python,
+                ),
+                (
+                    "run_bash", "commands", {"type": "array", "items": {"type": "string"}, "minItems": 1,
+                    "description": "One command per entry, e.g. [\"pwd\", \"uname -s\"]. Do not combine separate steps "
+                                   "with ; or &&. Keep a loop or conditional in one multiline entry. Max 8,000 UTF-8 bytes total."},
+                    "Run local Bash commands in one shell, chaining entries like &&. Directory and variable changes "
+                    "persist between entries; each entry must succeed before the next starts.", runner.run_bash, runner.preview_bash,
+                ),
+            ):
+                shell_companions.append(Tool(
+                    name=name,
+                    description=description + " Full access as the current user: writes and network allowed, inherited "
+                    "environment and credentials. Requires approval. No temporary scripts. Returns stdout, stderr, "
+                    "exit_code, timed_out and truncated; captures at most 16,000 bytes. Foreground jobs only.",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            source_name: source_schema,
+                            "cwd": {"type": "string", "description": cwd_description},
+                            "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": FULL_MAX_TIMEOUT,
+                                                "default": FULL_DEFAULT_TIMEOUT},
+                        },
+                        "required": [source_name], "additionalProperties": False,
+                    },
+                    fn=fn, requires_confirmation=True, confirmation_context=context,
+                    shell_mode=shell_mode, preview=preview,
+                ))
+            ssh = SSHRunner(runner.root)
+            shell_companions.append(Tool(
+                name="run_ssh",
+                description="Run Bash or Python over noninteractive batch-mode SSH. Prefer this over ssh in run_shell. "
+                "Supply exactly one of bash or python. Source goes through stdin, without shell quoting or temp files. "
+                "Uses your SSH configuration and existing trusted host keys; no password or host-key prompts. "
+                "Requires approval. Returns stdout, stderr, exit_code, timed_out, truncated (16,000-byte output cap). "
+                "Timeout/interrupt disconnects SSH; remote processes may survive. Foreground jobs only.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "host": {"type": "string", "description": "SSH config alias, hostname, or user@host (e.g. oswald)"},
+                        "bash": {
+                            "type": "array", "items": {"type": "string"}, "minItems": 1,
+                            "description": "One Bash command per entry, e.g. [\"pwd\", \"uname -s\"]. "
+                            "Do not combine separate commands using ; or &&. Lethe chains entries in one shell, "
+                            "preserving cd/variables and stopping on failure. Keep a loop or conditional in one "
+                            "multiline entry. Max 8,000 UTF-8 bytes total. No ssh wrapper.",
+                        },
+                        "python": {"type": "string", "description": "Literal multiline Python 3 source, max 8,000 UTF-8 bytes. "
+                                   "No python -c, quoting, or heredoc; choose this instead of bash for Python."},
+                        "cwd": {"type": "string", "description": "Remote working directory; supports ~/ (default: SSH login directory)"},
+                        "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": FULL_MAX_TIMEOUT,
+                                            "default": FULL_DEFAULT_TIMEOUT},
+                    },
+                    "required": ["host"],
+                    # llama.cpp's XML tool parser needs an object root. A root
+                    # oneOf hides every property and constrains calls to {}.
+                    # SSHRunner.preview enforces exactly one payload before approval.
+                    "additionalProperties": False,
+                },
+                fn=ssh.run,
+                requires_confirmation=True,
+                confirmation_context="SSH · full access on the remote host · source sent over the network",
+                shell_mode=shell_mode,
+                preview=ssh.preview,
+            ))
         files = FileTools(runner.root, confined=shell_mode != ShellMode.FULL)
         path_description = (
             "File path, relative to the starting directory or absolute (supports ~)"
             if shell_mode == ShellMode.FULL else "File path within the workspace"
         )
-        file_tools.append(Tool(
+        shell_companions.append(Tool(
             name="read_file",
             description="Read a UTF-8 text file. Each line is returned as 'N<tab>text' where N is the line number; the "
             "prefix is not part of the file. Long files are returned in chunks; a notice at the end gives the offset "
@@ -407,7 +527,7 @@ def build_registry(
             confirmation_context=context,
         ))
         if shell_mode == ShellMode.FULL:
-            file_tools.append(Tool(
+            shell_companions.append(Tool(
                 name="write_file",
                 description="Create a file, or replace the entire contents of an existing one, with the given text. "
                 "Parent directories are created. content is the literal file text: no shell quoting, escaping, or "
@@ -426,7 +546,7 @@ def build_registry(
                 confirmation_context=context,
                 preview=files.preview_write,
             ))
-            file_tools.append(Tool(
+            shell_companions.append(Tool(
                 name="edit_file",
                 description="Change part of an existing text file by replacing old_string with new_string. old_string "
                 "must match the file exactly, including indentation and line breaks, and must occur exactly once "
@@ -458,7 +578,7 @@ def build_registry(
         t = available[n]
         out[t.name] = t
         if n == "shell":
-            out.update({f.name: f for f in file_tools})
+            out.update({t.name: t for t in shell_companions})
     return out
 
 
