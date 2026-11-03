@@ -35,9 +35,9 @@ So the defaults are:
 | web UI | **off** (`--no-webui`) | the stock UI stores chat history in the browser |
 | `/slots` endpoint | **off** (`--no-slots`) | it exposes the live prompt text over HTTP |
 | `/metrics` | off | |
-| API access | **per-launch random key** (`--api-key`), on a free loopback port | other local software — including a web page doing `fetch("http://localhost:…")` — can't use the model |
+| API access | **per-launch random key** (`--api-key`), on a free loopback port; `lethe serve`: the key you put in `LETHE_API_KEY`, on the port you name, still loopback only | other local software — including a web page doing `fetch("http://localhost:…")` — can't use the model without the key |
 | prompt/KV cache to disk (`--slot-save-path`) | never set | KV lives in GPU-wired memory only |
-| model process | **lives only as long as the chat** | `lethe` starts `llama-server` when it starts and kills it when it exits, however it exits; there is no daemon, no pid file, nothing holding 30 GB between chats |
+| model process | **lives only as long as the chat** (or the `lethe serve` terminal) | `lethe` starts `llama-server` when it starts and kills it when it exits, however it exits; there is no daemon, no pid file, nothing holding 30 GB between chats |
 | model server network | `127.0.0.1` only | approved full-shell commands can use the network |
 | `chat` REPL | writes nothing; no history file (Up-arrow recall is in-memory only) | `/wipe` clears the conversation **and** the terminal scrollback |
 | terminal notifications | bell + a fixed phrase ("lethe: reply finished", "lethe: a tool call needs your approval") | Notification Center keeps notification text around, so no conversation content ever goes into one |
@@ -387,6 +387,7 @@ from the GGUF's architecture, following each model card's recommendations; overr
 | `lethe models` | the same table for what's on disk, plus what other model processes are holding right now |
 | `lethe default [spec]` | show / set the default model |
 | `lethe [chat] [spec] [-f FILE …] [--save] [--resume ID] [--web] [--tools [--shell-mode full] [--shell-dir PATH]] [--system TEXT] [--no-system] [--ctx N] [--kv q8_0] [--no-thinking] [--effort low] [--vision]` (the command word is optional) | loads the model for the session (memory plan printed against what is *free now*; native max context if it fits) and unloads it on exit; streaming REPL (Ctrl-C stops a reply but keeps what it thought and wrote so far; the next prompt tells the model it was cut short); while a reply is produced, a line pinned to the bottom of the terminal shows context used (≈ until the server reports the exact position), the phase (prompt processing with progress, thinking, writing, tool call), tokens and tok/s, and elapsed time; after every turn: prompt tok/s, gen tok/s, MTP acceptance, context used/total (colored; warns at 80%); the terminal bell rings when a reply finishes or a tool call waits for approval (iTerm2, Ghostty, WezTerm and kitty also get a desktop notification — a fixed phrase, never content) |
+| `LETHE_API_KEY=… lethe serve [spec] --port N [--parallel N] [--ctx N] [--no-thinking] [--effort low] [--kv q8_0]` | serves the model to other programs on this machine at `http://127.0.0.1:N/v1` (OpenAI-compatible) until Ctrl-C or the terminal closes, then unloads it; requests send `Authorization: Bearer $LETHE_API_KEY`; the profile's sampler is the server default; nothing is logged |
 | `lethe conversations [--unlock] [--delete ID]` | encrypted saved conversations |
 | `lethe bench [spec] [-d 0,32768]` | `llama-bench` prompt/gen speeds at context depth — **no speculative decoding, this is the floor** |
 | `lethe bench [spec] --server [-d 0,32768]` | through `llama-server`: no-MTP vs embedded MTP vs FastMTP, real tok/s and acceptance |
@@ -405,6 +406,16 @@ Key" (Settings → Profiles → Keyboard), or Ctrl+J, or remap Shift+Return to C
 There is no background server. Each `lethe` run starts its own `llama-server` on a free loopback
 port with a random key and kills it on exit, so nothing holds the model's memory between chats.
 With the model file in the OS cache that costs about three seconds per launch.
+
+`lethe serve` is for programs that need a stable address (for example a game's character runtime). It is
+still a foreground run: it loads the model, serves `http://127.0.0.1:<port>/v1` with the key from
+`LETHE_API_KEY`, and unloads the model when you press Ctrl-C or close the terminal. It refuses a port that is
+already in use, binds only to loopback, and never prints or stores the key:
+
+```bash
+export LETHE_API_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
+uv run lethe serve HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF:Q8_K_P --port 8091 --parallel 4 --ctx 65536 --no-thinking
+```
 
 ## Images and video
 

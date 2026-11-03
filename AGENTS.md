@@ -15,7 +15,7 @@ model's inputs and outputs. Every feature must preserve that:
 - llama-server always runs with `--no-webui --no-slots`, bound to 127.0.0.1, no `--metrics`, and a
   per-launch random `--api-key` (recovered from the process table by `chat`/`key`; it stops other local
   software and browser pages from using the model — a same-user process could read it from `ps`, that's
-  accepted).
+  accepted). `lethe serve` uses the user's `LETHE_API_KEY` instead (see below).
 - Saved conversations (`vault.py`) are the ONE content-persistence feature: opt-in per invocation
   (`chat --save`, `/save`; `--resume` only reads — nothing is written unless `--save` is given too or `/save`
   is typed, which continue the same id with the same passphrase), AES-256-GCM with a scrypt-derived key, passphrase held in memory
@@ -76,9 +76,16 @@ model's inputs and outputs. Every feature must preserve that:
 - **No background model server, ever.** `lethe` is to a local model what claude code is to Claude: the
   model is loaded when a run starts and unloaded when it ends. `server.Session` starts `llama-server` on a
   free loopback port and kills it on exit (`with` block, atexit, SIGTERM/SIGHUP handlers; only SIGKILL of
-  lethe can leave one behind). There is no `serve`/`stop`/`key` command, no process-table discovery and no
-  fixed port; a second `lethe` is simply a second server. The user runs other llama-servers on this machine
+  lethe can leave one behind). There is no `stop`/`key` command, no daemon, no pid file and no process-table
+  discovery; a second `lethe` is simply a second server. The user runs other llama-servers on this machine
   by hand (e.g. port 8090); never touch them.
+- **`lethe serve` is the one fixed-port, fixed-key run** (approved by Conor 2026-11-03 so local programs,
+  e.g. the earshot orchestrator, have a stable endpoint). It is a foreground command like `chat`: the same
+  `server.Session`, so the model unloads when its terminal ends. Always bound to 127.0.0.1 (no host option),
+  on the port the user names (`--port` is required; a port already in use is refused, never taken over),
+  with the key read from `LETHE_API_KEY` (at least 16 characters; never generated, printed, stored, or taken
+  as an argument), and the same traceless llama-server flags. It never daemonizes, detaches, or reattaches,
+  and it logs no requests.
 - Hugging Face: `HF_HUB_DISABLE_TELEMETRY=1` (set in `hub.py` before import); downloads are anonymous
   unless the repo is gated (then falls back to `HF_TOKEN`).
 - Before adding any dependency or feature, ask: does it write, phone home, or cache content? Apart from
