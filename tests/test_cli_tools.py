@@ -93,10 +93,13 @@ def test_the_model_is_unloaded_even_when_the_chat_fails(monkeypatch, tmp_path):
 
 
 def test_there_is_no_background_server_command():
-    for gone in ("serve", "stop", "key", "log"):
+    # `serve` exists but is foreground only (tests/test_serve.py); nothing stops, finds, or keys a server
+    # from another process, and nothing logs.
+    for gone in ("stop", "key", "log"):
         result = CliRunner().invoke(cli.app, [gone])
         assert result.exit_code == 2, gone
-    assert "serve" not in cli._normalize_argv(["serve"])[:1] or cli._normalize_argv(["serve"]) == ["chat", "serve"]
+    assert cli._normalize_argv(["serve"]) == ["serve"]
+    assert CliRunner().invoke(cli.app, ["serve"]).exit_code == 2  # --port is required
 
 
 def test_bare_tools_flag_means_shell_and_composes_with_web():

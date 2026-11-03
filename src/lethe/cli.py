@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import socket
 import subprocess
 import sys
 import time
@@ -18,7 +20,7 @@ from . import config, hub, server, spec as S, tools as T, vault
 from .attachments import is_image, is_video
 from .ggufmeta import ModelShape, parse_local, quant_from_filename, shape_from_kv
 from .paths import llama_bin, llama_dir, models_dir
-from .profiles import profile_for
+from .profiles import describe, profile_for
 from .shell import ShellMode
 from .sysinfo import GiB, fmt_bytes, llama_processes, machine, wired_bytes
 
@@ -29,6 +31,10 @@ err = Console(stderr=True)
 KV_BYTES = {"f16": 2.0, "bf16": 2.0, "q8_0": 1.0625, "q4_0": 0.5625}
 CTX_COLUMNS = [32_768, 131_072]
 MODEL_HELP = "Model: owner/repo:QUANT (canonical), a .gguf path, or a unique substring of a local file name"
+SERVE_KEY_ENV = "LETHE_API_KEY"
+SERVE_KEY_MIN = 16
+SAMPLER_FLAGS = {"temperature": "--temp", "top_p": "--top-p", "top_k": "--top-k", "min_p": "--min-p",
+                 "presence_penalty": "--presence-penalty", "repeat_penalty": "--repeat-penalty"}
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -238,8 +244,13 @@ def _plan_ctx(shape: ModelShape, size: int, ctx: int, kv: str, draft_size: int, 
 def _start(
     lm: S.LocalModel, *, ctx: int, kv: str, vision: bool, thinking: bool, effort: str | None,
     mtp: bool = True, draft: bool = True, debug: bool = False,
+    port: int = 0, parallel: int = 1, api_key: str | None = None, extra: list[str] | None = None,
 ) -> Iterator[server.Session]:
-    """A server for this run only: `with _start(...) as srv:` kills it on the way out."""
+    """A server for this run only: `with _start(...) as srv:` kills it on the way out.
+
+    `port`, `parallel`, `api_key` and `extra` exist for `lethe serve`; every other caller gets a free
+    port, one slot and a fresh random key.
+    """
     shape = _shape(lm.path)
     mmproj = _find_sidecar(lm, "mmproj") if vision else None
     if vision and not mmproj:
@@ -252,7 +263,8 @@ def _start(
         mtp = False
     cfg = server.ServeConfig(
         model=lm.path, n_ctx=ctx, draft=draft_path, mtp=mtp, mmproj=mmproj, kv_type=kv,
-        thinking=thinking, reasoning_effort=effort, debug=debug, api_key=server.new_api_key(),
+        thinking=thinking, reasoning_effort=effort, debug=debug, api_key=api_key or server.new_api_key(),
+        port=port, parallel=parallel, extra=list(extra or []),
     )
     con.print(
         f"speculative: {'FastMTP draft ' + draft_path.name if draft_path else ('embedded MTP' if mtp else 'off')}"
@@ -586,6 +598,75 @@ def chat(
             shell_dir=(shell_dir if shell_dir is not None else Path.cwd()).expanduser().resolve(),
             resume_args=_resume_args(cli_context),
         ))
+
+
+def _sampler_flags(sampling: dict) -> list[str]:
+    """The profile's sampler as llama-server defaults, for requests that do not set their own."""
+    out: list[str] = []
+    for key, flag in SAMPLER_FLAGS.items():
+        if key in sampling:
+            out += [flag, str(sampling[key])]
+    return out
+
+
+def _port_free(port: int) -> bool:
+    with socket.socket() as sock:
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
+@app.command()
+def serve(
+    model: Optional[str] = typer.Argument(None, help=MODEL_HELP + " (default: lethe.toml)"),
+    port: int = typer.Option(..., "--port", min=1024, max=65535, help="Port on 127.0.0.1 (required: the programs you serve need a stable address)"),
+    parallel: int = typer.Option(1, "--parallel", min=1, max=64, help="Requests served at once; they share the context"),
+    ctx: int = typer.Option(0, "--ctx", "-c", help="Context tokens for all slots together (0 = native max if it fits)"),
+    kv: str = typer.Option("f16", help="KV cache type: f16|q8_0|q4_0"),
+    thinking: bool = typer.Option(True, help="Thinking mode by default (a request may override it with chat_template_kwargs)"),
+    effort: Optional[str] = typer.Option(None, "--effort", help="Reasoning effort: low|medium|xhigh (Qwen3.8; the template's default is xhigh)"),
+    debug_server: bool = typer.Option(False, "--debug-server", help="Show llama-server's own output on the terminal (nothing is written to disk)"),
+    yes: bool = typer.Option(False, "-y", "--yes", help="Download the model without asking if it isn't local"),
+):
+    """Serve the model to other programs on this machine until you press Ctrl-C.
+
+    Foreground only: the model is loaded when this command starts and unloaded when it ends, like a chat. Always bound to 127.0.0.1, OpenAI-compatible at /v1. Requests must send the key you put in LETHE_API_KEY as `Authorization: Bearer …`; lethe never prints, stores, or takes it as an argument. Nothing is logged.
+    """
+    key = os.environ.get(SERVE_KEY_ENV, "")
+    if len(key) < SERVE_KEY_MIN:
+        err.print(f"[red]set {SERVE_KEY_ENV} to a secret of at least {SERVE_KEY_MIN} characters[/] — "
+                  "clients send it as 'Authorization: Bearer …'; lethe never prints or stores it")
+        raise typer.Exit(1)
+    if kv not in KV_BYTES:
+        raise typer.BadParameter(f"choose one of {', '.join(KV_BYTES)}", param_hint="--kv")
+    if not _port_free(port):
+        err.print(f"[red]port {port} is already in use on 127.0.0.1[/] — choose another; lethe never touches servers it did not start")
+        raise typer.Exit(1)
+    model = model or config.default_model()
+    if not model:
+        err.print("[red]no model given and no default set[/] — lethe serve owner/repo:QUANT --port …, or lethe default …")
+        raise typer.Exit(1)
+    lm = _resolve_or_offer(model, yes)
+    sampling = profile_for(_shape(lm.path)).sampling(thinking)
+    try:
+        with _start(lm, ctx=ctx, kv=kv, vision=False, thinking=thinking, effort=effort, debug=debug_server,
+                    port=port, parallel=parallel, api_key=key, extra=_sampler_flags(sampling)) as srv:
+            p = server.props(srv.url, srv.api_key)
+            n_ctx = int(p.get("default_generation_settings", {}).get("n_ctx", 0))
+            con.print(
+                f"serving [bold]{lm.spec}[/] at [bold]{srv.url}/v1[/] (OpenAI-compatible) · "
+                f"{parallel} slot{'s' if parallel != 1 else ''} · context per request {n_ctx:,} · "
+                f"thinking {'on' if thinking else 'off'} · default sampler {describe(sampling)} · key from ${SERVE_KEY_ENV}"
+            )
+            con.print("[dim]foreground only: Ctrl-C (or closing this terminal) stops the server and unloads the model[/]")
+            code = srv.wait()
+    except KeyboardInterrupt:
+        con.print("[dim]stopped; the model is unloaded[/]")
+        return
+    err.print(f"[red]llama-server exited on its own with {code}[/]; run with --debug-server to see its output")
+    raise typer.Exit(1)
 
 
 @app.command()

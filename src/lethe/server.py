@@ -7,7 +7,9 @@ daemon to discover, no pid file, and nothing left holding the model afterwards.
 Privacy posture (the default, see README "Logless by default"):
   * llama-server runs with --log-disable, --no-webui, --no-slots; its output goes to
     /dev/null unless `--debug-server` shows it on the terminal. Nothing is written anywhere.
-  * Bound to 127.0.0.1 on a free port, with a per-launch random API key.
+  * Bound to 127.0.0.1 on a free port, with a per-launch random API key. `lethe serve` is the one
+    exception: still loopback and still foreground, but on a port the user names, with the key the
+    user puts in LETHE_API_KEY, so other local programs have a stable endpoint.
 """
 
 from __future__ import annotations
@@ -173,6 +175,19 @@ class Session:
 
     def __exit__(self, *exc) -> None:
         self.stop()
+
+    def wait(self, poll: float = 0.5) -> int:
+        """Block until llama-server exits on its own and return its exit code (used by `lethe serve`).
+
+        Polls rather than blocking in waitpid, so Ctrl-C and the SIGTERM/SIGHUP handlers stay prompt.
+        Returns 0 if the server was stopped by us while waiting.
+        """
+        while self.proc is not None:
+            code = self.proc.poll()
+            if code is not None:
+                return code
+            time.sleep(poll)
+        return 0
 
     def _arm(self) -> None:
         """Make sure the server dies with us, not only when the `with` block is left cleanly."""
